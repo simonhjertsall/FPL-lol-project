@@ -1,11 +1,13 @@
 {
   "name": "FPL Nicknames",
-  "description": "Replace player names with your nicknames on FPL.",
-  "version": "0.1",
+  "description": "FPL xG overlay",
+  "version": "0.3",
   "manifest_version": 3,
-  "icons": {
-    "128": "icon.png"
-  },
+
+  "host_permissions": [
+    "https://fantasy.premierleague.com/*"
+  ],
+
   "content_scripts": [
     {
       "matches": ["https://fantasy.premierleague.com/*"],
