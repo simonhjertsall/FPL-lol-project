@@ -3,7 +3,7 @@ console.log("FPL XG running", new Date().toISOString());
 const BASE = "https://fantasy.premierleague.com/api";
 
 let playerMap = {}; // web_name -> { id, element_type }
-let cache = {};     // id -> { xgi90, mpg5, starts5, games, dcPts5, dcMatches5, hasDC }
+let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC }
 
 async function loadBootstrap() {
   try {
@@ -66,8 +66,11 @@ async function loadPlayerData(id) {
     };
     const starts5 = last5.reduce((sum, m) => sum + (isStart(m) ? 1 : 0), 0);
 
-    // Defensive contributions (new FPL metric). Field name may vary.
-    // We track both total DC points and how many matches had any DC.
+    // Clean Sheets over last 5 played matches
+    const cs5 = last5.reduce((sum, m) => sum + (Number(m.clean_sheets ?? 0) > 0 ? 1 : 0), 0);
+
+    // Defensive contributions: count matches where DC >= 10 (point-awarding threshold).
+    // Field name may vary; if missing, we mark hasDC=false and show n/a in UI.
     const pickDC = (m) => {
       const v = m.defensive_contribution ?? m.defensive_contributions ?? m.def_contribution;
       if (v == null) return null;
@@ -76,14 +79,12 @@ async function loadPlayerData(id) {
     };
 
     let hasDC = false;
-    let dcPts5 = 0;
-    let dcMatches5 = 0;
+    let dc10Matches5 = 0;
     for (const m of last5) {
       const v = pickDC(m);
       if (v == null) continue;
       hasDC = true;
-      dcPts5 += v;
-      if (v >= 10) dcMatches5 += 1;
+      if (v >= 10) dc10Matches5 += 1;
     }
 
     const xg5 = last5.reduce((sum, m) => sum + pickXG(m), 0);
@@ -97,9 +98,9 @@ async function loadPlayerData(id) {
       mpg5: mpg5.toFixed(1),
       starts5,
       games,
+      cs5,
       hasDC,
-      dcPts5: dcPts5.toFixed(0),
-      dcMatches5
+      dc10Matches5
     };
 
     return cache[id];
@@ -177,7 +178,7 @@ async function injectUnderName(el) {
 
   div.innerHTML = `
     ${isDef
-      ? `<span style="color:#cbd5e1">DC10+: ${stats.hasDC ? `${stats.dcPts5} pts (${stats.dcMatches5}/${stats.games})` : "n/a"}</span><br />`
+      ? `<span style="color:#cbd5e1">CS5: ${stats.cs5}/${stats.games} | DC10+: ${stats.hasDC ? `${stats.dc10Matches5}/${stats.games}` : "n/a"}</span><br />`
       : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
     <span style="color:#cbd5e1">mpg5: ${stats.mpg5}</span>
     | <span style="color:#cbd5e1">starts5: ${stats.starts5}/${stats.games}</span>
