@@ -3,12 +3,18 @@ const DEBUG = false;
 const FALLBACK_SCAN_MIN_INTERVAL_MS = 2500;
 const SCHEDULE_DELAY_MS = 200;
 const MAX_FALLBACK_TARGETS = 120;
+const CAPTAIN_FETCH_CONCURRENCY = 6;
 const NAME_SELECTORS = '[data-testid="player-name"], [data-testid="pitch-element-player-name"], .PitchElementData__Name, .PitchElement__Name, [class*="PitchElementData__Name"], [class*="PitchElement__Name"]';
+const LEAGUE_GRID_TEMPLATE = "56px minmax(180px, 1fr) 64px 72px 96px";
 
 let playerMap = {}; // web_name -> { id, element_type }
+let playerById = {}; // id -> { web_name, element_type }
 let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC }
+let currentEventId = null;
 const pendingByContainer = new WeakMap(); // container -> Set(playerId)
 const lastFallbackSuccessByView = new Map(); // viewId -> timestamp
+const captainCache = new Map(); // `${entryId}:${eventId}` -> captain text
+const captainPending = new Map(); // `${entryId}:${eventId}` -> Promise<string>
 let scanInProgress = false;
 let scanQueued = false;
 let scheduledTimer = null;
@@ -28,6 +34,11 @@ const VIEWS = [
     id: "entry",
     matchRoute: (path) => /^\/entry\/\d+(?:\/|$)/.test(path),
     scan: scanPitchNameBadges
+  },
+  {
+    id: "leagues-standings",
+    matchRoute: (path) => /^\/leagues\/\d+\/standings\/[^/]+(?:\/|$)/.test(path),
+    scan: scanLeagueStandingsCaptains
   }
 ];
 
@@ -69,17 +80,30 @@ async function loadBootstrap() {
     const data = await res.json();
 
     playerMap = {};
+    playerById = {};
     data.elements.forEach((p) => {
       playerMap[p.web_name] = {
         id: p.id,
         element_type: p.element_type
       };
+      playerById[p.id] = {
+        web_name: p.web_name,
+        element_type: p.element_type
+      };
     });
+    currentEventId = getCurrentEventId(data);
 
     debugLog("bootstrap loaded, players:", Object.keys(playerMap).length);
   } catch (e) {
     console.error("loadBootstrap failed", e);
   }
+}
+
+function getCurrentEventId(bootstrapData) {
+  const events = Array.isArray(bootstrapData?.events) ? bootstrapData.events : [];
+  const current = events.find((e) => e && (e.is_current || e.is_next));
+  if (current && Number.isFinite(Number(current.id))) return Number(current.id);
+  return null;
 }
 
 async function loadPlayerData(id) {
@@ -264,6 +288,128 @@ async function mapWithConcurrency(items, limit, worker) {
   await Promise.all(runners);
 }
 
+function parseEntryIdFromHref(href) {
+  const m = String(href || "").match(/\/entry\/(\d+)(?:\/|$)/);
+  if (!m) return null;
+  return Number(m[1]);
+}
+
+function getStandingsTable() {
+  return (
+    document.querySelector('table[aria-label*="Standings"]') ||
+    document.querySelector('.react-aria-Table[role="grid"]') ||
+    document.querySelector('table[role="grid"]')
+  );
+}
+
+function getStandingsRows() {
+  const table = getStandingsTable();
+  if (!table) return [];
+  return Array.from(table.querySelectorAll("tbody tr[role='row'], tbody tr"))
+    .filter((row) => row.querySelector('a[href*="/entry/"]'));
+}
+
+function ensureCaptainHeader() {
+  const table = getStandingsTable();
+  if (!table) return;
+  const headerRow = table.querySelector("thead tr");
+  if (!headerRow) return;
+  const existing = headerRow.querySelector(".fpl-captain-header");
+  if (existing && existing.tagName !== "TH") existing.remove();
+  if (headerRow.querySelector(".fpl-captain-header")) return;
+
+  const h = document.createElement("th");
+  h.className = "fpl-captain-header";
+  h.setAttribute("role", "columnheader");
+  h.textContent = "Captain";
+  h.style.setProperty("min-width", "96px", "important");
+  h.style.setProperty("font-weight", "600", "important");
+  h.style.setProperty("color", "#cbd5e1", "important");
+  h.style.setProperty("text-align", "left", "important");
+  h.style.setProperty("padding-left", "8px", "important");
+  h.style.setProperty("white-space", "nowrap", "important");
+  headerRow.appendChild(h);
+}
+
+function applyLeagueGridLayout() {
+  const table = getStandingsTable();
+  if (!table) return;
+  table.style.setProperty("width", "100%", "important");
+  table.style.setProperty("table-layout", "fixed", "important");
+
+  const rows = table.querySelectorAll("thead tr, tbody tr");
+  rows.forEach((row) => {
+    row.style.setProperty("display", "grid", "important");
+    row.style.setProperty("grid-template-columns", LEAGUE_GRID_TEMPLATE, "important");
+    row.style.setProperty("align-items", "center", "important");
+  });
+
+  const cells = table.querySelectorAll("th, td, [role='columnheader'], [role='gridcell'], [role='rowheader']");
+  cells.forEach((cell) => {
+    cell.style.setProperty("overflow", "hidden", "important");
+    cell.style.setProperty("text-overflow", "ellipsis", "important");
+  });
+}
+
+function injectCaptainIntoRow(row, captainText, eventId) {
+  const hasTabularCells = Boolean(row.querySelector("td, [role='gridcell'], [role='rowheader']"));
+  if (!hasTabularCells) return false;
+
+  let cell = row.querySelector(".fpl-captain-cell");
+  if (cell && cell.tagName !== "TD") {
+    cell.remove();
+    cell = null;
+  }
+  if (!cell) {
+    cell = document.createElement("td");
+    cell.className = "fpl-captain-cell";
+    cell.setAttribute("role", "gridcell");
+    cell.style.setProperty("min-width", "96px", "important");
+    cell.style.setProperty("padding-left", "8px", "important");
+    cell.style.setProperty("font-size", "12px", "important");
+    cell.style.setProperty("color", "#e2e8f0", "important");
+    cell.style.setProperty("white-space", "nowrap", "important");
+    cell.style.setProperty("vertical-align", "middle", "important");
+    row.appendChild(cell);
+  }
+  cell.textContent = captainText;
+  cell.dataset.eventId = String(eventId);
+  return true;
+}
+
+function cleanupStrayCaptainInline() {
+  document.querySelectorAll(".fpl-captain-inline").forEach((n) => n.remove());
+}
+
+async function loadEntryCaptain(entryId, eventId) {
+  const key = `${entryId}:${eventId}`;
+  if (captainCache.has(key)) return captainCache.get(key);
+  if (captainPending.has(key)) return captainPending.get(key);
+
+  const p = (async () => {
+    try {
+      const res = await fetch(`${BASE}/entry/${entryId}/event/${eventId}/picks/`);
+      if (!res.ok) throw new Error(`entry picks failed ${entryId}/${eventId}: HTTP ${res.status}`);
+      const data = await res.json();
+      const picks = Array.isArray(data?.picks) ? data.picks : [];
+      const cap = picks.find((x) => x && x.is_captain);
+      const elementId = Number(cap?.element);
+      const name = playerById[elementId]?.web_name || (Number.isFinite(elementId) ? `#${elementId}` : "n/a");
+      captainCache.set(key, name);
+      return name;
+    } catch (e) {
+      debugLog("loadEntryCaptain failed", entryId, eventId, e);
+      captainCache.set(key, "n/a");
+      return "n/a";
+    } finally {
+      captainPending.delete(key);
+    }
+  })();
+
+  captainPending.set(key, p);
+  return p;
+}
+
 function getActiveViews(pathname) {
   return VIEWS.filter((view) => view.matchRoute(pathname));
 }
@@ -344,6 +490,33 @@ async function scanPitchNameBadges(viewId) {
     lastFallbackSuccessByView.set(viewId, Date.now());
   }
   debugLog(`[${viewId}] fallback matched name nodes:`, matched);
+}
+
+async function scanLeagueStandingsCaptains(viewId) {
+  if (!currentEventId) return;
+
+  const rows = getStandingsRows();
+  if (rows.length === 0) return;
+  cleanupStrayCaptainInline();
+  ensureCaptainHeader();
+  applyLeagueGridLayout();
+
+  const jobs = [];
+  for (const row of rows) {
+    const anchor = row.querySelector('a[href*="/entry/"]');
+    if (!anchor) continue;
+    const entryId = parseEntryIdFromHref(anchor.getAttribute("href"));
+    if (!entryId) continue;
+    jobs.push({ row, anchor, entryId });
+  }
+  if (jobs.length === 0) return;
+
+  await mapWithConcurrency(jobs, CAPTAIN_FETCH_CONCURRENCY, async (job) => {
+    const captain = await loadEntryCaptain(job.entryId, currentEventId);
+    injectCaptainIntoRow(job.row, captain, currentEventId);
+  });
+
+  debugLog(`[${viewId}] captain cells updated:`, jobs.length);
 }
 
 async function scan() {
