@@ -1,14 +1,70 @@
-console.log("FPL XG running", new Date().toISOString());
-
 const BASE = "https://fantasy.premierleague.com/api";
+const DEBUG = false;
+const FALLBACK_SCAN_MIN_INTERVAL_MS = 2500;
+const SCHEDULE_DELAY_MS = 200;
+const MAX_FALLBACK_TARGETS = 120;
+const NAME_SELECTORS = '[data-testid="player-name"], [data-testid="pitch-element-player-name"], .PitchElementData__Name, .PitchElement__Name, [class*="PitchElementData__Name"], [class*="PitchElement__Name"]';
 
 let playerMap = {}; // web_name -> { id, element_type }
 let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC }
+const pendingByContainer = new WeakMap(); // container -> Set(playerId)
+const lastFallbackSuccessByView = new Map(); // viewId -> timestamp
+let scanInProgress = false;
+let scanQueued = false;
+let scheduledTimer = null;
+
+const VIEWS = [
+  {
+    id: "my-team",
+    matchRoute: (path) => /^\/my-team(?:\/|$)/.test(path),
+    scan: scanPitchNameBadges
+  },
+  {
+    id: "transfers",
+    matchRoute: (path) => /^\/transfers(?:\/|$)/.test(path),
+    scan: scanPitchNameBadges
+  },
+  {
+    id: "entry",
+    matchRoute: (path) => /^\/entry\/\d+(?:\/|$)/.test(path),
+    scan: scanPitchNameBadges
+  }
+];
+
+function debugLog(...args) {
+  if (!DEBUG) return;
+  console.log(...args);
+}
+
+function shouldAttemptScan() {
+  if (!document.body) return false;
+  const path = window.location.pathname || "/";
+  return VIEWS.some((view) => view.matchRoute(path));
+}
+
+function shouldScheduleFromMutations(mutations) {
+  for (const m of mutations) {
+    if (m.type !== "childList") continue;
+    if (m.addedNodes && m.addedNodes.length > 0) return true;
+  }
+  return false;
+}
+
+function scheduleScan() {
+  if (scheduledTimer) return;
+  scheduledTimer = setTimeout(async () => {
+    scheduledTimer = null;
+    await scan();
+  }, SCHEDULE_DELAY_MS);
+}
 
 async function loadBootstrap() {
   try {
     const res = await fetch(`${BASE}/bootstrap-static/`);
-    console.log("bootstrap-static status:", res.status);
+    debugLog("bootstrap-static status:", res.status);
+    if (!res.ok) {
+      throw new Error(`bootstrap-static failed: HTTP ${res.status}`);
+    }
 
     const data = await res.json();
 
@@ -20,7 +76,7 @@ async function loadBootstrap() {
       };
     });
 
-    console.log("bootstrap loaded, players:", Object.keys(playerMap).length);
+    debugLog("bootstrap loaded, players:", Object.keys(playerMap).length);
   } catch (e) {
     console.error("loadBootstrap failed", e);
   }
@@ -32,6 +88,9 @@ async function loadPlayerData(id) {
   try {
     const res = await fetch(`${BASE}/element-summary/${id}/`);
     // console.log("element-summary status", id, res.status);
+    if (!res.ok) {
+      throw new Error(`element-summary failed for ${id}: HTTP ${res.status}`);
+    }
     const data = await res.json();
 
     const hist = Array.isArray(data.history) ? data.history : [];
@@ -110,13 +169,6 @@ async function loadPlayerData(id) {
   }
 }
 
-function colorFor(value) {
-  const v = Number(value);
-  if (v > 2) return "#1db954"; // green
-  if (v > 1) return "#e6b800"; // yellow
-  return "#d11a2a";            // red
-}
-
 function colorForXGI90(value) {
   const v = Number(value);
   if (v >= 0.8) return "#1db954";
@@ -126,9 +178,27 @@ function colorForXGI90(value) {
 
 function getPlayerCardContainer(el) {
   return (
-    el.closest('[data-testid*="pitch"], [data-testid*="element"], [class*="PitchElement"], [class*="PitchElementData"], [class*="pitchElement"], [class*="Pitch"]') ||
+    el.closest('[data-testid="pitch-element"], [data-testid*="pitch-element"], [class*="PitchElement"], [class*="pitchElement"]') ||
     el.parentElement
   );
+}
+
+function beginInject(container, playerId) {
+  let set = pendingByContainer.get(container);
+  if (!set) {
+    set = new Set();
+    pendingByContainer.set(container, set);
+  }
+  if (set.has(playerId)) return false;
+  set.add(playerId);
+  return true;
+}
+
+function endInject(container, playerId) {
+  const set = pendingByContainer.get(container);
+  if (!set) return;
+  set.delete(playerId);
+  if (set.size === 0) pendingByContainer.delete(container);
 }
 
 async function injectUnderName(el) {
@@ -144,75 +214,91 @@ async function injectUnderName(el) {
   const existingInContainer = container.querySelector(`.fpl-xg-badge[data-player-id="${id}"]`);
   if (existingInContainer) return;
 
-  // Prevent async re-entrancy (scan can fire many times while fetch is in flight)
-  // We store the currently injecting player id on the container.
-  if (container.dataset.xgInjected === "pending" || container.dataset.xgInjected === "true") {
-    return;
-  }
-  container.dataset.xgInjected = "pending";
-
-  const stats = await loadPlayerData(id);
-  if (!stats) {
-    delete container.dataset.xgInjected;
+  // Prevent async re-entrancy for this specific player in this specific container.
+  if (!beginInject(container, id)) {
     return;
   }
 
-  // If another scan already inserted the badge while we awaited, just exit.
-  const nowExists = container.querySelector(`.fpl-xg-badge[data-player-id="${id}"]`);
-  if (nowExists) {
-    container.dataset.xgInjected = "true";
-    return;
+  try {
+    const stats = await loadPlayerData(id);
+    if (!stats) return;
+
+    // If another scan already inserted the badge while we awaited, just exit.
+    const nowExists = container.querySelector(`.fpl-xg-badge[data-player-id="${id}"]`);
+    if (nowExists) return;
+
+    // Clean up only stale/duplicate badges for this same player.
+    container.querySelectorAll(`.fpl-xg-badge[data-player-id="${id}"]`).forEach((n) => n.remove());
+
+    const div = document.createElement("div");
+    div.className = "fpl-xg-badge";
+    div.dataset.playerId = String(id);
+    div.style.fontSize = "11px";
+    div.style.marginTop = "2px";
+    div.style.fontWeight = "600";
+
+    const isDef = element_type === 2; // 2 = Defender in FPL API
+
+    div.innerHTML = `
+      ${isDef
+        ? `<span style="color:#cbd5e1">CS5: ${stats.cs5}/${stats.games} | DC10+: ${stats.hasDC ? `${stats.dc10Matches5}/${stats.games}` : "n/a"}</span><br />`
+        : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
+      <span style="color:#cbd5e1">mpg5: ${stats.mpg5}</span>
+      | <span style="color:#cbd5e1">starts5: ${stats.starts5}/${stats.games}</span>
+    `;
+
+    container.appendChild(div);
+  } finally {
+    endInject(container, id);
   }
-
-  // Clean up any stale/duplicate badges inside this container.
-  container.querySelectorAll('.fpl-xg-badge').forEach((n) => n.remove());
-
-  const div = document.createElement("div");
-  div.className = "fpl-xg-badge";
-  div.dataset.playerId = String(id);
-  div.style.fontSize = "11px";
-  div.style.marginTop = "2px";
-  div.style.fontWeight = "600";
-
-  const isDef = element_type === 2; // 2 = Defender in FPL API
-
-  div.innerHTML = `
-    ${isDef
-      ? `<span style="color:#cbd5e1">CS5: ${stats.cs5}/${stats.games} | DC10+: ${stats.hasDC ? `${stats.dc10Matches5}/${stats.games}` : "n/a"}</span><br />`
-      : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
-    <span style="color:#cbd5e1">mpg5: ${stats.mpg5}</span>
-    | <span style="color:#cbd5e1">starts5: ${stats.starts5}/${stats.games}</span>
-  `;
-
-  container.appendChild(div);
-  container.dataset.xgInjected = "true";
 }
 
-async function scan() {
+async function mapWithConcurrency(items, limit, worker) {
+  const queue = [...items];
+  const runners = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      await worker(item);
+    }
+  });
+  await Promise.all(runners);
+}
+
+function getActiveViews(pathname) {
+  return VIEWS.filter((view) => view.matchRoute(pathname));
+}
+
+async function scanPitchNameBadges(viewId) {
   // First try: known selectors (may change as FPL deploys new UI)
-  const nameNodes = document.querySelectorAll(
-    '[data-testid="player-name"], [data-testid="pitch-element-player-name"], .PitchElementData__Name, .PitchElement__Name, [class*="PitchElementData__Name"], [class*="PitchElement__Name"]'
-  );
+  const nameNodes = document.querySelectorAll(NAME_SELECTORS);
 
   if (Object.keys(playerMap).length === 0) {
-    console.log("scan skipped: playerMap empty");
+    debugLog("scan skipped: playerMap empty");
     return;
   }
 
   if (nameNodes.length > 0) {
-    console.log("name nodes found (selector):", nameNodes.length);
+    debugLog(`[${viewId}] name nodes found (selector):`, nameNodes.length);
+    const targets = [];
     for (const el of nameNodes) {
       const name = (el.textContent || "").trim();
       if (!name) continue;
       if (!playerMap[name]) continue;
-      await injectUnderName(el);
+      targets.push(el);
     }
+    await mapWithConcurrency(targets, 6, injectUnderName);
+    return;
+  }
+
+  const now = Date.now();
+  const lastSuccess = lastFallbackSuccessByView.get(viewId) || 0;
+  if (lastSuccess > 0 && now - lastSuccess < FALLBACK_SCAN_MIN_INTERVAL_MS) {
     return;
   }
 
   // Fallback: walk text nodes and match exact player web_name.
   // This is more robust across UI changes.
-  console.log("name nodes found (selector): 0 — using text-node fallback");
+  debugLog(`[${viewId}] name nodes found (selector): 0 - using text-node fallback`);
 
   const seen = new Set();
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
@@ -234,6 +320,7 @@ async function scan() {
   });
 
   let matched = 0;
+  const targets = [];
   let node;
   while ((node = walker.nextNode())) {
     const name = (node.nodeValue || "").trim();
@@ -249,13 +336,44 @@ async function scan() {
     seen.add(key);
 
     matched++;
-    await injectUnderName(el);
+    targets.push(el);
+    if (targets.length >= MAX_FALLBACK_TARGETS) break;
+  }
+  await mapWithConcurrency(targets, 6, injectUnderName);
+  if (matched > 0) {
+    lastFallbackSuccessByView.set(viewId, Date.now());
+  }
+  debugLog(`[${viewId}] fallback matched name nodes:`, matched);
+}
+
+async function scan() {
+  if (!shouldAttemptScan()) return;
+  if (scanInProgress) {
+    scanQueued = true;
+    return;
   }
 
-  console.log("fallback matched name nodes:", matched);
+  scanInProgress = true;
+
+  try {
+    const path = window.location.pathname || "/";
+    const activeViews = getActiveViews(path);
+    if (activeViews.length === 0) return;
+
+    for (const view of activeViews) {
+      await view.scan(view.id);
+    }
+  } finally {
+    scanInProgress = false;
+    if (scanQueued) {
+      scanQueued = false;
+      scheduleScan();
+    }
+  }
 }
 
 async function init() {
+  debugLog("FPL XG running", new Date().toISOString());
   await loadBootstrap();
   await scan();
 }
@@ -263,18 +381,14 @@ async function init() {
 init();
 
 // re-run on DOM updates (SPA)
-let scheduled = false;
-const observer = new MutationObserver(() => {
-  if (scheduled) return;
-  scheduled = true;
-  setTimeout(() => {
-    scheduled = false;
-    scan();
-  }, 200);
+const observer = new MutationObserver((mutations) => {
+  if (!shouldScheduleFromMutations(mutations)) return;
+  scheduleScan();
 });
 
 observer.observe(document.body, { childList: true, subtree: true });
 
 // extra rescans in case the pitch renders after initial load
-setTimeout(scan, 500);
-setTimeout(scan, 1500);
+setTimeout(scheduleScan, 500);
+setTimeout(scheduleScan, 1500);
+
