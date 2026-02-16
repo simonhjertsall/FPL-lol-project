@@ -4,6 +4,8 @@ const FALLBACK_SCAN_MIN_INTERVAL_MS = 2500;
 const SCHEDULE_DELAY_MS = 200;
 const MAX_FALLBACK_TARGETS = 120;
 const CAPTAIN_FETCH_CONCURRENCY = 6;
+const LEAGUE_EO_ID = 244800;
+const LEAGUE_EO_RIVALS_LIMIT = Number.POSITIVE_INFINITY;
 const NAME_SELECTORS = '[data-testid="player-name"], [data-testid="pitch-element-player-name"], .PitchElementData__Name, .PitchElement__Name, [class*="PitchElementData__Name"], [class*="PitchElement__Name"]';
 const MY_FT_CACHE_KEY = "fplxg_my_free_transfers_v1";
 // Temporary pragmatic escape hatch for your own row when upstream FT sources are unreliable.
@@ -22,7 +24,7 @@ const SHOW_FT_DEBUG = true;
 let playerMap = {}; // web_name -> { id, element_type }
 let playerById = {}; // id -> { web_name, element_type, team }
 let teamById = {}; // id -> { short_name, name }
-let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC }
+let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC, savePoints5, xgcPerMatch5, hasXGC }
 let currentEventId = null;
 let nextEventId = null;
 let fixturesByTeam = new Map(); // teamId -> [{ oppShort, isHome, difficulty, event, kickoff }]
@@ -35,8 +37,9 @@ const entryHistoryCache = new Map(); // entryId -> entry history payload
 const entryHistoryPending = new Map(); // entryId -> Promise<object|null>
 const entryTransfersCache = new Map(); // entryId -> transfers array
 const entryTransfersPending = new Map(); // entryId -> Promise<array>
+const leagueEoCache = new Map(); // eventId -> { eoByPlayerId: Map<number, number>, rivalsCount: number }
+const leagueEoPending = new Map(); // eventId -> Promise<{ eoByPlayerId, rivalsCount }>
 let myEntryId = null;
-let myEntryIdResolved = false;
 let myEntryIdPending = null; // Promise<number|null>
 let myTeamTransfersCache = null; // { limit, made } | null
 let myTeamTransfersPending = null; // Promise<{ limit, made } | null>
@@ -280,8 +283,14 @@ async function loadPlayerData(id) {
 
     // Clean Sheets over last 5 played matches
     const cs5 = last5.reduce((sum, m) => sum + (Number(m.clean_sheets ?? 0) > 0 ? 1 : 0), 0);
+    // Save points over last 5 (1 point per 3 saves, rounded down per match).
+    const savePoints5 = last5.reduce((sum, m) => {
+      const saves = Number(m.saves ?? 0);
+      if (!Number.isFinite(saves) || saves <= 0) return sum;
+      return sum + Math.floor(saves / 3);
+    }, 0);
 
-    // Defensive contributions: count matches where DC >= 10 (point-awarding threshold).
+    // Defensive contributions over the last 5 played matches.
     // Field name may vary; if missing, we mark hasDC=false and show n/a in UI.
     const pickDC = (m) => {
       const v = m.defensive_contribution ?? m.defensive_contributions ?? m.def_contribution;
@@ -301,6 +310,20 @@ async function loadPlayerData(id) {
 
     const xg5 = last5.reduce((sum, m) => sum + pickXG(m), 0);
     const xa5 = last5.reduce((sum, m) => sum + pickXA(m), 0);
+    const pickXGC = (row) => {
+      const v = row.xGC ?? row.expected_goals_conceded;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    let hasXGC = false;
+    let xgc5 = 0;
+    for (const m of last5) {
+      const v = pickXGC(m);
+      if (v == null) continue;
+      hasXGC = true;
+      xgc5 += v;
+    }
+    const xgcPerMatch5 = games > 0 ? (xgc5 / games) : 0;
 
     const xgi5 = xg5 + xa5;
     const xgi90 = min5 > 0 ? (xgi5 / (min5 / 90)) : 0;
@@ -312,7 +335,10 @@ async function loadPlayerData(id) {
       games,
       cs5,
       hasDC,
-      dc10Matches5
+      dc10Matches5,
+      savePoints5,
+      xgcPerMatch5: Number(xgcPerMatch5.toFixed(2)),
+      hasXGC
     };
 
     return cache[id];
@@ -375,6 +401,10 @@ async function injectUnderName(el) {
   try {
     const stats = await loadPlayerData(id);
     if (!stats) return;
+    const leagueEoData = Number.isFinite(Number(currentEventId))
+      ? await loadLeagueEOForEvent(currentEventId)
+      : { eoByPlayerId: new Map(), rivalsCount: 0 };
+    const eoText = formatPercent(leagueEoData?.eoByPlayerId?.get(id));
     if (!fixturesLoaded) await loadFixtures();
     const nextFixtures = getNextFixturesForPlayer(id, 5);
 
@@ -392,20 +422,25 @@ async function injectUnderName(el) {
     div.style.marginTop = "2px";
     div.style.fontWeight = "600";
 
+    const isGk = element_type === 1; // 1 = Goalkeeper in FPL API
     const isDef = element_type === 2; // 2 = Defender in FPL API
 
     const fixtureHtml = nextFixtures.length > 0
       ? `
-        <div style="margin-top:2px; display:flex; gap:3px; flex-wrap:wrap;">
+        <div style="margin-top:2px; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:2px; max-width:100%;">
           ${nextFixtures.map((f) => {
-            const ha = f.isHome ? "H" : "A";
-            const label = `${String(f.oppShort || "?").toLowerCase()}${ha === "H" ? "" : ""}`;
+            const label = String(f.oppShort || "?").toLowerCase();
             return `<span style="
-              display:inline-block;
-              padding:1px 4px;
+              display:block;
+              min-width:0;
+              text-align:center;
+              padding:1px 0;
               border-radius:3px;
-              font-size:9px;
-              line-height:1.2;
+              font-size:8px;
+              line-height:1.15;
+              white-space:nowrap;
+              overflow:hidden;
+              text-overflow:ellipsis;
               color:#0b1020;
               background:${fixtureBgByDifficulty(f.difficulty)};
             ">${label}</span>`;
@@ -416,10 +451,14 @@ async function injectUnderName(el) {
 
     div.innerHTML = `
       ${isDef
-        ? `<span style="color:#cbd5e1">CS5: ${stats.cs5}/${stats.games} | DC10+: ${stats.hasDC ? `${stats.dc10Matches5}/${stats.games}` : "n/a"}</span><br />`
+        ? `<span style="color:#cbd5e1">CS: ${stats.cs5}/5</span><br />
+           <span style="color:#cbd5e1">DC: ${stats.hasDC ? `${stats.dc10Matches5}/5` : "n/a"}</span><br />`
+        : isGk
+          ? `<span style="color:#cbd5e1">CS: ${stats.cs5}/5</span><br />
+             <span style="color:#cbd5e1">SP: ${stats.savePoints5}</span><br />
+             <span style="color:#cbd5e1">xGC/match: ${stats.hasXGC ? Number(stats.xgcPerMatch5).toFixed(2) : "n/a"}</span><br />`
         : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
-      <span style="color:#cbd5e1">mpg5: ${stats.mpg5}</span>
-      | <span style="color:#cbd5e1">starts5: ${stats.starts5}/${stats.games}</span>
+      <span style="color:#cbd5e1">EO: ${eoText}</span>
       ${fixtureHtml}
     `;
 
@@ -444,6 +483,124 @@ function parseEntryIdFromHref(href) {
   const m = String(href || "").match(/\/entry\/(\d+)(?:\/|$)/);
   if (!m) return null;
   return Number(m[1]);
+}
+
+function formatPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "n/a";
+  const rounded = Math.round(n * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
+}
+
+async function loadLeagueStandingsEntries(leagueId, limit) {
+  const out = [];
+  let page = 1;
+
+  while (out.length < limit) {
+    const url = `${BASE}/leagues-classic/${leagueId}/standings/?page_new_entries=1&page_standings=${page}`;
+    const res = await fetch(url);
+    if (!res.ok) break;
+
+    const data = await res.json();
+    const rows = Array.isArray(data?.standings?.results) ? data.standings.results : [];
+    if (rows.length === 0) break;
+
+    for (const row of rows) {
+      out.push(row);
+      if (out.length >= limit) break;
+    }
+
+    if (!data?.standings?.has_next) break;
+    page += 1;
+  }
+
+  return out;
+}
+
+async function loadLeagueEOForEvent(eventId) {
+  const ev = Number(eventId);
+  if (!Number.isFinite(ev) || ev < 1) return { eoByPlayerId: new Map(), rivalsCount: 0 };
+  if (leagueEoCache.has(ev)) return leagueEoCache.get(ev);
+  if (leagueEoPending.has(ev)) return leagueEoPending.get(ev);
+
+  const p = (async () => {
+    try {
+      const myIdFromApi = await loadMyEntryId();
+      const myIdFromNav = getMyEntryIdFromNav();
+      const myIdFromCache = Number(getCachedMyFreeTransfers()?.entryId);
+      const myId = [myIdFromApi, myIdFromNav, myIdFromCache]
+        .map((v) => Number(v))
+        .find((v) => Number.isFinite(v) && v > 0);
+      const standings = await loadLeagueStandingsEntries(LEAGUE_EO_ID, LEAGUE_EO_RIVALS_LIMIT);
+      const rivals = standings
+        .map((row) => Number(row?.entry))
+        .filter((id) => Number.isFinite(id) && id > 0 && (!Number.isFinite(myId) || Number(id) !== Number(myId)))
+        .slice(0, LEAGUE_EO_RIVALS_LIMIT);
+
+      if (rivals.length === 0) {
+        const empty = { eoByPlayerId: new Map(), rivalsCount: 0 };
+        leagueEoCache.set(ev, empty);
+        return empty;
+      }
+
+      const eoUnitsByPlayer = new Map();
+      let successfulRivals = 0;
+      await mapWithConcurrency(rivals, CAPTAIN_FETCH_CONCURRENCY, async (entryId) => {
+        try {
+          const res = await fetch(`${BASE}/entry/${entryId}/event/${ev}/picks/`);
+          if (!res.ok) return;
+
+          const data = await res.json();
+          const picks = Array.isArray(data?.picks) ? data.picks : [];
+          const isTripleCaptain = String(data?.active_chip || "").trim().toLowerCase() === "3xc";
+          successfulRivals += 1;
+
+          for (const pick of picks) {
+            const playerId = Number(pick?.element);
+            if (!Number.isFinite(playerId)) continue;
+
+            // Owned = +1
+            eoUnitsByPlayer.set(playerId, (eoUnitsByPlayer.get(playerId) || 0) + 1);
+
+            // Captain = +1 extra, Triple Captain = +1 extra again
+            if (pick?.is_captain) {
+              eoUnitsByPlayer.set(playerId, (eoUnitsByPlayer.get(playerId) || 0) + 1);
+              if (isTripleCaptain) {
+                eoUnitsByPlayer.set(playerId, (eoUnitsByPlayer.get(playerId) || 0) + 1);
+              }
+            }
+          }
+        } catch (_) {
+          // Ignore one rival failure; EO still works with remaining rivals.
+        }
+      });
+
+      if (successfulRivals === 0) {
+        const empty = { eoByPlayerId: new Map(), rivalsCount: 0 };
+        leagueEoCache.set(ev, empty);
+        return empty;
+      }
+
+      const eoByPlayerId = new Map();
+      for (const [playerId, eoUnits] of eoUnitsByPlayer.entries()) {
+        eoByPlayerId.set(playerId, (Number(eoUnits) / successfulRivals) * 100);
+      }
+
+      const out = { eoByPlayerId, rivalsCount: successfulRivals };
+      leagueEoCache.set(ev, out);
+      return out;
+    } catch (e) {
+      debugLog("loadLeagueEOForEvent failed", ev, e);
+      const out = { eoByPlayerId: new Map(), rivalsCount: 0 };
+      leagueEoCache.set(ev, out);
+      return out;
+    } finally {
+      leagueEoPending.delete(ev);
+    }
+  })();
+
+  leagueEoPending.set(ev, p);
+  return p;
 }
 
 function getCachedMyFreeTransfers() {
@@ -579,15 +736,20 @@ function getMyEntryIdFromNav() {
 
 async function loadMyEntryId() {
   if (Number.isFinite(myEntryId)) return myEntryId;
-  if (myEntryIdResolved) return null;
   if (myEntryIdPending) return myEntryIdPending;
 
   const p = (async () => {
     try {
       const navId = getMyEntryIdFromNav();
       if (Number.isFinite(navId)) {
-        myEntryIdResolved = true;
         return navId;
+      }
+
+      const cachedFt = getCachedMyFreeTransfers();
+      const cachedEntryId = Number(cachedFt?.entryId);
+      if (Number.isFinite(cachedEntryId)) {
+        myEntryId = cachedEntryId;
+        return myEntryId;
       }
 
       const res = await fetch(`${BASE}/me/`, { credentials: "include" });
@@ -602,11 +764,9 @@ async function loadMyEntryId() {
       if (Number.isFinite(resolved)) {
         myEntryId = resolved;
       }
-      myEntryIdResolved = true;
       return Number.isFinite(myEntryId) ? myEntryId : null;
     } catch (e) {
       debugLog("loadMyEntryId failed", e);
-      myEntryIdResolved = true;
       return null;
     } finally {
       myEntryIdPending = null;
@@ -1207,4 +1367,3 @@ observer.observe(document.body, { childList: true, subtree: true });
 // extra rescans in case the pitch renders after initial load
 setTimeout(scheduleScan, 500);
 setTimeout(scheduleScan, 1500);
-
