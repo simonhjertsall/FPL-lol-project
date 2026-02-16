@@ -5,16 +5,44 @@ const SCHEDULE_DELAY_MS = 200;
 const MAX_FALLBACK_TARGETS = 120;
 const CAPTAIN_FETCH_CONCURRENCY = 6;
 const NAME_SELECTORS = '[data-testid="player-name"], [data-testid="pitch-element-player-name"], .PitchElementData__Name, .PitchElement__Name, [class*="PitchElementData__Name"], [class*="PitchElement__Name"]';
-const LEAGUE_GRID_TEMPLATE = "56px minmax(180px, 1fr) 64px 72px 96px";
+const MY_FT_CACHE_KEY = "fplxg_my_free_transfers_v1";
+// Temporary pragmatic escape hatch for your own row when upstream FT sources are unreliable.
+// Set to a number (0-5) to force Remaining FT for your own entry, or keep null.
+const MANUAL_MY_REMAINING_FT = 2;
+const LEAGUE_DATAPOINTS = [
+  { key: "captain", label: "C" },
+  { key: "viceCaptain", label: "VC" },
+  { key: "chip", label: "Chip" },
+  { key: "transferCost", label: "Transfer Cost" },
+  { key: "transfersMade", label: "Transfers" },
+  { key: "remainingTransfers", label: "Remaining FT (calc)" }
+];
+const SHOW_FT_DEBUG = true;
 
 let playerMap = {}; // web_name -> { id, element_type }
-let playerById = {}; // id -> { web_name, element_type }
+let playerById = {}; // id -> { web_name, element_type, team }
+let teamById = {}; // id -> { short_name, name }
 let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC }
 let currentEventId = null;
+let nextEventId = null;
+let fixturesByTeam = new Map(); // teamId -> [{ oppShort, isHome, difficulty, event, kickoff }]
+let fixturesLoaded = false;
 const pendingByContainer = new WeakMap(); // container -> Set(playerId)
 const lastFallbackSuccessByView = new Map(); // viewId -> timestamp
-const captainCache = new Map(); // `${entryId}:${eventId}` -> captain text
-const captainPending = new Map(); // `${entryId}:${eventId}` -> Promise<string>
+const leagueDataCache = new Map(); // `${entryId}:${eventId}` -> entry league data
+const leagueDataPending = new Map(); // `${entryId}:${eventId}` -> Promise<object>
+const entryHistoryCache = new Map(); // entryId -> entry history payload
+const entryHistoryPending = new Map(); // entryId -> Promise<object|null>
+const entryTransfersCache = new Map(); // entryId -> transfers array
+const entryTransfersPending = new Map(); // entryId -> Promise<array>
+let myEntryId = null;
+let myEntryIdResolved = false;
+let myEntryIdPending = null; // Promise<number|null>
+let myTeamTransfersCache = null; // { limit, made } | null
+let myTeamTransfersPending = null; // Promise<{ limit, made } | null>
+let myFreeTransfersMemory = null; // number | null
+let myTransfersPageFtCache = null; // number | null
+let myTransfersPageFtPending = null; // Promise<number|null>
 let scanInProgress = false;
 let scanQueued = false;
 let scheduledTimer = null;
@@ -81,6 +109,19 @@ async function loadBootstrap() {
 
     playerMap = {};
     playerById = {};
+    teamById = {};
+    fixturesByTeam = new Map();
+    fixturesLoaded = false;
+
+    const teams = Array.isArray(data.teams) ? data.teams : [];
+    teams.forEach((t) => {
+      if (!t || !Number.isFinite(Number(t.id))) return;
+      teamById[Number(t.id)] = {
+        short_name: String(t.short_name || "").trim() || `T${t.id}`,
+        name: String(t.name || "").trim() || `Team ${t.id}`
+      };
+    });
+
     data.elements.forEach((p) => {
       playerMap[p.web_name] = {
         id: p.id,
@@ -88,10 +129,14 @@ async function loadBootstrap() {
       };
       playerById[p.id] = {
         web_name: p.web_name,
-        element_type: p.element_type
+        element_type: p.element_type,
+        team: Number(p.team)
       };
     });
     currentEventId = getCurrentEventId(data);
+    nextEventId = getNextEventId(data);
+
+    await loadFixtures();
 
     debugLog("bootstrap loaded, players:", Object.keys(playerMap).length);
   } catch (e) {
@@ -99,10 +144,94 @@ async function loadBootstrap() {
   }
 }
 
+async function loadFixtures() {
+  try {
+    const res = await fetch(`${BASE}/fixtures/`);
+    if (!res.ok) throw new Error(`fixtures failed: HTTP ${res.status}`);
+    const fixtures = await res.json();
+    const list = Array.isArray(fixtures) ? fixtures : [];
+
+    const grouped = new Map();
+    for (const fx of list) {
+      if (!fx) continue;
+      if (fx.finished || fx.started) continue;
+
+      const event = Number(fx.event);
+      const kickoff = Date.parse(String(fx.kickoff_time || "")) || 0;
+      const teamH = Number(fx.team_h);
+      const teamA = Number(fx.team_a);
+      if (!Number.isFinite(teamH) || !Number.isFinite(teamA)) continue;
+
+      const oppForH = teamById[teamA]?.short_name || `T${teamA}`;
+      const oppForA = teamById[teamH]?.short_name || `T${teamH}`;
+      const hDiff = Number(fx.team_h_difficulty);
+      const aDiff = Number(fx.team_a_difficulty);
+
+      if (!grouped.has(teamH)) grouped.set(teamH, []);
+      if (!grouped.has(teamA)) grouped.set(teamA, []);
+
+      grouped.get(teamH).push({
+        oppShort: oppForH,
+        isHome: true,
+        difficulty: Number.isFinite(hDiff) ? hDiff : null,
+        event,
+        kickoff
+      });
+      grouped.get(teamA).push({
+        oppShort: oppForA,
+        isHome: false,
+        difficulty: Number.isFinite(aDiff) ? aDiff : null,
+        event,
+        kickoff
+      });
+    }
+
+    grouped.forEach((arr, teamId) => {
+      arr.sort((a, b) => {
+        const ea = Number.isFinite(a.event) ? a.event : 999;
+        const eb = Number.isFinite(b.event) ? b.event : 999;
+        if (ea !== eb) return ea - eb;
+        return a.kickoff - b.kickoff;
+      });
+      grouped.set(teamId, arr);
+    });
+
+    fixturesByTeam = grouped;
+    fixturesLoaded = true;
+  } catch (e) {
+    debugLog("loadFixtures failed", e);
+    fixturesByTeam = new Map();
+    fixturesLoaded = false;
+  }
+}
+
+function fixtureBgByDifficulty(difficulty) {
+  const d = Number(difficulty);
+  if (!Number.isFinite(d)) return "#9ca3af";
+  if (d <= 2) return "#22c55e";
+  if (d === 3) return "#84cc16";
+  if (d === 4) return "#f97316";
+  return "#ef4444";
+}
+
+function getNextFixturesForPlayer(playerId, count = 5) {
+  const teamId = Number(playerById[playerId]?.team);
+  if (!Number.isFinite(teamId)) return [];
+  const arr = fixturesByTeam.get(teamId) || [];
+  return arr.slice(0, count);
+}
+
 function getCurrentEventId(bootstrapData) {
   const events = Array.isArray(bootstrapData?.events) ? bootstrapData.events : [];
   const current = events.find((e) => e && (e.is_current || e.is_next));
   if (current && Number.isFinite(Number(current.id))) return Number(current.id);
+  return null;
+}
+
+function getNextEventId(bootstrapData) {
+  const events = Array.isArray(bootstrapData?.events) ? bootstrapData.events : [];
+  const next = events.find((e) => e && e.is_next);
+  if (next && Number.isFinite(Number(next.id))) return Number(next.id);
   return null;
 }
 
@@ -246,6 +375,8 @@ async function injectUnderName(el) {
   try {
     const stats = await loadPlayerData(id);
     if (!stats) return;
+    if (!fixturesLoaded) await loadFixtures();
+    const nextFixtures = getNextFixturesForPlayer(id, 5);
 
     // If another scan already inserted the badge while we awaited, just exit.
     const nowExists = container.querySelector(`.fpl-xg-badge[data-player-id="${id}"]`);
@@ -263,12 +394,33 @@ async function injectUnderName(el) {
 
     const isDef = element_type === 2; // 2 = Defender in FPL API
 
+    const fixtureHtml = nextFixtures.length > 0
+      ? `
+        <div style="margin-top:2px; display:flex; gap:3px; flex-wrap:wrap;">
+          ${nextFixtures.map((f) => {
+            const ha = f.isHome ? "H" : "A";
+            const label = `${String(f.oppShort || "?").toLowerCase()}${ha === "H" ? "" : ""}`;
+            return `<span style="
+              display:inline-block;
+              padding:1px 4px;
+              border-radius:3px;
+              font-size:9px;
+              line-height:1.2;
+              color:#0b1020;
+              background:${fixtureBgByDifficulty(f.difficulty)};
+            ">${label}</span>`;
+          }).join("")}
+        </div>
+      `
+      : "";
+
     div.innerHTML = `
       ${isDef
         ? `<span style="color:#cbd5e1">CS5: ${stats.cs5}/${stats.games} | DC10+: ${stats.hasDC ? `${stats.dc10Matches5}/${stats.games}` : "n/a"}</span><br />`
         : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
       <span style="color:#cbd5e1">mpg5: ${stats.mpg5}</span>
       | <span style="color:#cbd5e1">starts5: ${stats.starts5}/${stats.games}</span>
+      ${fixtureHtml}
     `;
 
     container.appendChild(div);
@@ -294,6 +446,228 @@ function parseEntryIdFromHref(href) {
   return Number(m[1]);
 }
 
+function getCachedMyFreeTransfers() {
+  try {
+    const raw = localStorage.getItem(MY_FT_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const value = Number(parsed?.value);
+    const entryId = Number(parsed?.entryId);
+    if (!Number.isFinite(value)) return null;
+    return {
+      value,
+      entryId: Number.isFinite(entryId) ? entryId : null,
+      eventId: Number(parsed?.eventId),
+      updatedAt: Number(parsed?.updatedAt || 0)
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function setCachedMyFreeTransfers(value) {
+  if (!Number.isFinite(Number(value))) return;
+  myFreeTransfersMemory = Number(value);
+  try {
+    const myId = getMyEntryIdFromNav();
+    localStorage.setItem(MY_FT_CACHE_KEY, JSON.stringify({
+      value: Number(value),
+      entryId: Number.isFinite(Number(myId)) ? Number(myId) : null,
+      eventId: Number.isFinite(Number(currentEventId)) ? Number(currentEventId) : null,
+      updatedAt: Date.now()
+    }));
+  } catch (_) {
+    // ignore storage failures
+  }
+}
+
+function scrapeFreeTransfersFromTransfersPage() {
+  const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+  const candidates = [];
+  const re = /(\d{1,2})\D{0,20}Free Transfers|Free Transfers\D{0,20}(\d{1,2})/gi;
+  let mm;
+  while ((mm = re.exec(bodyText)) !== null) {
+    const a = Number(mm[1]);
+    const b = Number(mm[2]);
+    if (Number.isFinite(a) && a >= 0 && a <= 5) candidates.push(a);
+    if (Number.isFinite(b) && b >= 0 && b <= 5) candidates.push(b);
+  }
+  if (candidates.length > 0) {
+    const positives = candidates.filter((v) => v > 0);
+    return positives.length > 0 ? Math.max(...positives) : Math.max(...candidates);
+  }
+
+  // Fallback: find any element that mentions "Free Transfers" (even if split/extra spaces)
+  // and read nearby numeric nodes.
+  const labels = Array.from(document.querySelectorAll("span, div, p, h2, h3, h4, strong, label"));
+  const labelNodes = labels.filter((n) => /free\s*transfers/i.test((n.textContent || "").replace(/\s+/g, " ").trim()));
+  const nearNums = [];
+
+  function collectNums(txt) {
+    if (!txt) return;
+    const found = Array.from(String(txt).matchAll(/\b(\d{1,2})\b/g))
+      .map((m) => Number(m[1]))
+      .filter((v) => Number.isFinite(v) && v >= 0 && v <= 5);
+    nearNums.push(...found);
+  }
+
+  for (const n of labelNodes) {
+    collectNums(n.previousElementSibling?.textContent);
+    collectNums(n.nextElementSibling?.textContent);
+    collectNums(n.parentElement?.textContent);
+    collectNums(n.closest("section, article, form, main, div")?.textContent);
+  }
+
+  if (nearNums.length === 0) return null;
+  const positiveNear = nearNums.filter((v) => v > 0);
+  return positiveNear.length > 0 ? Math.max(...positiveNear) : Math.max(...nearNums);
+}
+
+async function loadMyFreeTransfersFromTransfersHtml() {
+  if (Number.isFinite(Number(myTransfersPageFtCache))) return Number(myTransfersPageFtCache);
+  if (myTransfersPageFtPending) return myTransfersPageFtPending;
+
+  const p = (async () => {
+    try {
+      const res = await fetch(`${window.location.origin}/transfers`, { credentials: "include" });
+      if (!res.ok) return null;
+      const html = await res.text();
+
+      // Best source if present in embedded JSON/state.
+      const mState = html.match(/"transfers"\s*:\s*\{\s*"limit"\s*:\s*(\d+)\s*,\s*"made"\s*:\s*(\d+)/i);
+      if (mState) {
+        const limit = Number(mState[1]);
+        const made = Number(mState[2]);
+        if (Number.isFinite(limit) && Number.isFinite(made)) {
+          const remaining = Math.max(0, limit - made);
+          myTransfersPageFtCache = remaining;
+          return remaining;
+        }
+      }
+
+      // Text fallback.
+      let mTxt = html.match(/\b(\d+)\s*Free Transfers\b/i);
+      if (!mTxt) mTxt = html.match(/\bFree Transfers\s*(\d+)\b/i);
+      if (mTxt) {
+        const v = Number(mTxt[1]);
+        if (Number.isFinite(v)) {
+          myTransfersPageFtCache = v;
+          return v;
+        }
+      }
+
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      myTransfersPageFtPending = null;
+    }
+  })();
+
+  myTransfersPageFtPending = p;
+  return p;
+}
+
+function getMyEntryIdFromNav() {
+  if (Number.isFinite(myEntryId)) return myEntryId;
+  const link = document.querySelector('a[href^="/entry/"][href*="/event/"]');
+  if (!link) return null;
+  const id = parseEntryIdFromHref(link.getAttribute("href"));
+  if (Number.isFinite(id)) myEntryId = id;
+  return Number.isFinite(id) ? id : null;
+}
+
+async function loadMyEntryId() {
+  if (Number.isFinite(myEntryId)) return myEntryId;
+  if (myEntryIdResolved) return null;
+  if (myEntryIdPending) return myEntryIdPending;
+
+  const p = (async () => {
+    try {
+      const navId = getMyEntryIdFromNav();
+      if (Number.isFinite(navId)) {
+        myEntryIdResolved = true;
+        return navId;
+      }
+
+      const res = await fetch(`${BASE}/me/`, { credentials: "include" });
+      if (!res.ok) throw new Error(`me failed: HTTP ${res.status}`);
+      const data = await res.json();
+      const fromPlayer = Number(data?.player?.entry);
+      const fromEntry = Number(data?.entry);
+      const resolved = Number.isFinite(fromPlayer)
+        ? fromPlayer
+        : (Number.isFinite(fromEntry) ? fromEntry : null);
+
+      if (Number.isFinite(resolved)) {
+        myEntryId = resolved;
+      }
+      myEntryIdResolved = true;
+      return Number.isFinite(myEntryId) ? myEntryId : null;
+    } catch (e) {
+      debugLog("loadMyEntryId failed", e);
+      myEntryIdResolved = true;
+      return null;
+    } finally {
+      myEntryIdPending = null;
+    }
+  })();
+
+  myEntryIdPending = p;
+  return p;
+}
+
+async function loadMyTeamTransfers(entryId, eventIdHint) {
+  if (!Number.isFinite(Number(entryId))) return null;
+  const cacheKey = Number.isFinite(Number(eventIdHint)) ? String(eventIdHint) : "default";
+  if (myTeamTransfersCache && myTeamTransfersCache[cacheKey]) return myTeamTransfersCache[cacheKey];
+  if (myTeamTransfersPending) return myTeamTransfersPending;
+
+  const p = (async () => {
+    try {
+      const urls = [];
+      if (Number.isFinite(Number(eventIdHint))) {
+        urls.push(`${BASE}/my-team/${entryId}/?event=${Number(eventIdHint)}`);
+      }
+      urls.push(`${BASE}/my-team/${entryId}/`);
+
+      let best = null;
+      for (const url of urls) {
+        const res = await fetch(url, { credentials: "include" });
+        if (!res.ok) continue;
+        const data = await res.json();
+        const limitRaw = Number(data?.transfers?.limit);
+        const madeRaw = Number(data?.transfers?.made);
+        if (!Number.isFinite(limitRaw) || !Number.isFinite(madeRaw)) continue;
+        const remaining = Math.max(0, limitRaw - madeRaw);
+        if (!best || remaining > best.remaining) {
+          best = { limit: limitRaw, made: madeRaw, remaining };
+        }
+      }
+
+      if (!best) {
+        if (!myTeamTransfersCache) myTeamTransfersCache = {};
+        myTeamTransfersCache[cacheKey] = null;
+        return null;
+      }
+
+      if (!myTeamTransfersCache) myTeamTransfersCache = {};
+      myTeamTransfersCache[cacheKey] = best;
+      return best;
+    } catch (e) {
+      debugLog("loadMyTeamTransfers failed", entryId, e);
+      if (!myTeamTransfersCache) myTeamTransfersCache = {};
+      myTeamTransfersCache[cacheKey] = null;
+      return null;
+    } finally {
+      myTeamTransfersPending = null;
+    }
+  })();
+
+  myTeamTransfersPending = p;
+  return p;
+}
+
 function getStandingsTable() {
   return (
     document.querySelector('table[aria-label*="Standings"]') ||
@@ -309,105 +683,369 @@ function getStandingsRows() {
     .filter((row) => row.querySelector('a[href*="/entry/"]'));
 }
 
-function ensureCaptainHeader() {
-  const table = getStandingsTable();
-  if (!table) return;
-  const headerRow = table.querySelector("thead tr");
-  if (!headerRow) return;
-  const existing = headerRow.querySelector(".fpl-captain-header");
-  if (existing && existing.tagName !== "TH") existing.remove();
-  if (headerRow.querySelector(".fpl-captain-header")) return;
-
-  const h = document.createElement("th");
-  h.className = "fpl-captain-header";
-  h.setAttribute("role", "columnheader");
-  h.textContent = "Captain";
-  h.style.setProperty("min-width", "96px", "important");
-  h.style.setProperty("font-weight", "600", "important");
-  h.style.setProperty("color", "#cbd5e1", "important");
-  h.style.setProperty("text-align", "left", "important");
-  h.style.setProperty("padding-left", "8px", "important");
-  h.style.setProperty("white-space", "nowrap", "important");
-  headerRow.appendChild(h);
+function cleanupCaptainInjections() {
+  document.querySelectorAll(".fpl-captain-header, .fpl-captain-cell, .fpl-captain-inline, .fpl-captain-inline-row, .fpl-league-meta, .fpl-league-transfers, .fpl-league-debug").forEach((n) => n.remove());
 }
 
-function applyLeagueGridLayout() {
-  const table = getStandingsTable();
-  if (!table) return;
-  table.style.setProperty("width", "100%", "important");
-  table.style.setProperty("table-layout", "fixed", "important");
+function injectLeagueMetaIntoTeamCell(row, data, eventId) {
+  const teamCell = row.querySelector("[role='rowheader'], td:nth-child(2)");
+  if (!teamCell) return;
 
-  const rows = table.querySelectorAll("thead tr, tbody tr");
-  rows.forEach((row) => {
-    row.style.setProperty("display", "grid", "important");
-    row.style.setProperty("grid-template-columns", LEAGUE_GRID_TEMPLATE, "important");
-    row.style.setProperty("align-items", "center", "important");
-  });
-
-  const cells = table.querySelectorAll("th, td, [role='columnheader'], [role='gridcell'], [role='rowheader']");
-  cells.forEach((cell) => {
-    cell.style.setProperty("overflow", "hidden", "important");
-    cell.style.setProperty("text-overflow", "ellipsis", "important");
-  });
-}
-
-function injectCaptainIntoRow(row, captainText, eventId) {
-  const hasTabularCells = Boolean(row.querySelector("td, [role='gridcell'], [role='rowheader']"));
-  if (!hasTabularCells) return false;
-
-  let cell = row.querySelector(".fpl-captain-cell");
-  if (cell && cell.tagName !== "TD") {
-    cell.remove();
-    cell = null;
+  let wrap = teamCell.querySelector(".fpl-league-meta");
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.className = "fpl-league-meta";
+    wrap.style.display = "flex";
+    wrap.style.flexWrap = "wrap";
+    wrap.style.gap = "4px";
+    wrap.style.marginTop = "4px";
+    teamCell.appendChild(wrap);
   }
-  if (!cell) {
-    cell = document.createElement("td");
-    cell.className = "fpl-captain-cell";
-    cell.setAttribute("role", "gridcell");
-    cell.style.setProperty("min-width", "96px", "important");
-    cell.style.setProperty("padding-left", "8px", "important");
-    cell.style.setProperty("font-size", "12px", "important");
-    cell.style.setProperty("color", "#e2e8f0", "important");
-    cell.style.setProperty("white-space", "nowrap", "important");
-    cell.style.setProperty("vertical-align", "middle", "important");
-    row.appendChild(cell);
+
+  wrap.innerHTML = "";
+  for (const item of LEAGUE_DATAPOINTS) {
+    const value = data?.[item.key];
+    if (value == null || value === "") continue;
+
+    const chip = document.createElement("span");
+    chip.className = "fpl-league-chip";
+    chip.style.fontSize = "10px";
+    chip.style.lineHeight = "1.2";
+    chip.style.padding = "1px 5px";
+    chip.style.border = "1px solid rgba(148,163,184,0.45)";
+    chip.style.borderRadius = "10px";
+    chip.style.color = "#cbd5e1";
+    chip.style.whiteSpace = "nowrap";
+    chip.textContent = `${item.label}: ${value}`;
+    wrap.appendChild(chip);
   }
-  cell.textContent = captainText;
-  cell.dataset.eventId = String(eventId);
-  return true;
+
+  const existingTransfers = teamCell.querySelector(".fpl-league-transfers");
+  if (existingTransfers) existingTransfers.remove();
+  const lines = Array.isArray(data?.transferLines) ? data.transferLines : [];
+  if (lines.length > 0) {
+    const tWrap = document.createElement("div");
+    tWrap.className = "fpl-league-transfers";
+    tWrap.style.marginTop = "4px";
+    tWrap.style.fontSize = "11px";
+    tWrap.style.lineHeight = "1.25";
+    tWrap.style.color = "#9fb3c8";
+
+    const maxLines = 3;
+    for (const line of lines.slice(0, maxLines)) {
+      const rowLine = document.createElement("div");
+      rowLine.textContent = line;
+      tWrap.appendChild(rowLine);
+    }
+    if (lines.length > maxLines) {
+      const more = document.createElement("div");
+      more.textContent = `+${lines.length - maxLines} more`;
+      more.style.opacity = "0.8";
+      tWrap.appendChild(more);
+    }
+    teamCell.appendChild(tWrap);
+  }
+
+  const existingDebug = teamCell.querySelector(".fpl-league-debug");
+  if (existingDebug) existingDebug.remove();
+  if (SHOW_FT_DEBUG && data?.ftDebug) {
+    const dbg = document.createElement("div");
+    dbg.className = "fpl-league-debug";
+    dbg.style.marginTop = "4px";
+    dbg.style.fontSize = "10px";
+    dbg.style.lineHeight = "1.2";
+    dbg.style.color = "#fbbf24";
+    dbg.textContent = data.ftDebug;
+    teamCell.appendChild(dbg);
+  }
+
+  wrap.dataset.eventId = String(eventId);
 }
 
-function cleanupStrayCaptainInline() {
-  document.querySelectorAll(".fpl-captain-inline").forEach((n) => n.remove());
-}
-
-async function loadEntryCaptain(entryId, eventId) {
-  const key = `${entryId}:${eventId}`;
-  if (captainCache.has(key)) return captainCache.get(key);
-  if (captainPending.has(key)) return captainPending.get(key);
+async function loadEntryHistory(entryId) {
+  if (entryHistoryCache.has(entryId)) return entryHistoryCache.get(entryId);
+  if (entryHistoryPending.has(entryId)) return entryHistoryPending.get(entryId);
 
   const p = (async () => {
     try {
-      const res = await fetch(`${BASE}/entry/${entryId}/event/${eventId}/picks/`);
+      const res = await fetch(`${BASE}/entry/${entryId}/history/`);
+      if (!res.ok) throw new Error(`entry history failed ${entryId}: HTTP ${res.status}`);
+      const data = await res.json();
+      entryHistoryCache.set(entryId, data);
+      return data;
+    } catch (e) {
+      debugLog("loadEntryHistory failed", entryId, e);
+      entryHistoryCache.set(entryId, null);
+      return null;
+    } finally {
+      entryHistoryPending.delete(entryId);
+    }
+  })();
+
+  entryHistoryPending.set(entryId, p);
+  return p;
+}
+
+async function loadEntryTransfers(entryId) {
+  if (entryTransfersCache.has(entryId)) return entryTransfersCache.get(entryId);
+  if (entryTransfersPending.has(entryId)) return entryTransfersPending.get(entryId);
+
+  const p = (async () => {
+    try {
+      const res = await fetch(`${BASE}/entry/${entryId}/transfers/`);
+      if (!res.ok) throw new Error(`entry transfers failed ${entryId}: HTTP ${res.status}`);
+      const data = await res.json();
+      const arr = Array.isArray(data) ? data : [];
+      entryTransfersCache.set(entryId, arr);
+      return arr;
+    } catch (e) {
+      debugLog("loadEntryTransfers failed", entryId, e);
+      entryTransfersCache.set(entryId, []);
+      return [];
+    } finally {
+      entryTransfersPending.delete(entryId);
+    }
+  })();
+
+  entryTransfersPending.set(entryId, p);
+  return p;
+}
+
+function computeRemainingTransfers(historyData, eventId, currentEventData) {
+  const targetEvent = Number(eventId);
+  if (!Number.isFinite(targetEvent) || targetEvent < 1) return null;
+
+  const currentRows = Array.isArray(historyData?.current) ? historyData.current : [];
+  const chips = Array.isArray(historyData?.chips) ? historyData.chips : [];
+  const isWildcardChip = (name) => {
+    const s = String(name || "").toLowerCase();
+    return s === "wc" || s.includes("wildcard");
+  };
+  const isFreeHitChip = (name) => {
+    const s = String(name || "").toLowerCase();
+    return s === "fh" || s.includes("freehit") || s.includes("free_hit");
+  };
+
+  const rowByEvent = new Map();
+  for (const r of currentRows) {
+    const ev = Number(r?.event);
+    if (!Number.isFinite(ev)) continue;
+    rowByEvent.set(ev, r);
+  }
+
+  const chipByEvent = new Map();
+  for (const c of chips) {
+    const ev = Number(c?.event);
+    if (!Number.isFinite(ev)) continue;
+    chipByEvent.set(ev, String(c?.name || "").toLowerCase());
+  }
+
+  // Simulate GW by GW so missing rows don't break FT accrual.
+  let ftEndPrev = 1; // after GW0 / before GW1
+  for (let ev = 1; ev <= targetEvent; ev += 1) {
+    const ftStart = ev === 1 ? 1 : Math.min(5, ftEndPrev + 1);
+
+    const row = rowByEvent.get(ev);
+    const isCurrent = ev === targetEvent;
+    const chipRaw = isCurrent
+      ? String(currentEventData?.activeChipRaw || chipByEvent.get(ev) || "")
+      : String(chipByEvent.get(ev) || "");
+    const chip = chipRaw.toLowerCase();
+
+    const transfersRaw = isCurrent
+      ? Number(currentEventData?.eventTransfers ?? row?.event_transfers ?? 0)
+      : Number(row?.event_transfers ?? 0);
+    const costRaw = isCurrent
+      ? Number(currentEventData?.eventTransfersCost ?? row?.event_transfers_cost ?? 0)
+      : Number(row?.event_transfers_cost ?? 0);
+
+    const transfers = Number.isFinite(transfersRaw) ? transfersRaw : 0;
+    const transferCost = Number.isFinite(costRaw) ? costRaw : 0;
+    // transfer cost is always 4 points per paid transfer.
+    const paidTransfers = Math.max(0, Math.floor(transferCost / 4));
+    const freeTransfersUsed = Math.max(0, transfers - paidTransfers);
+
+    if (isWildcardChip(chip)) {
+      // With modern FT rules, wildcard should not consume banked free transfers.
+      ftEndPrev = ftStart;
+      continue;
+    }
+    if (isFreeHitChip(chip)) {
+      ftEndPrev = ftStart;
+      continue;
+    }
+
+    ftEndPrev = Math.max(0, ftStart - freeTransfersUsed);
+  }
+
+  // Fallback guard: if current GW exists in history but is stale/missing cost fields,
+  // avoid reporting 0 when it should likely be at least 1 after subtracted paid moves.
+  if (
+    targetEvent > 1 &&
+    Number(currentEventData?.eventTransfers ?? 0) > 0 &&
+    Number(currentEventData?.eventTransfersCost ?? 0) >= 0 &&
+    ftEndPrev === 0
+  ) {
+    const currentTransfers = Math.max(0, Number(currentEventData?.eventTransfers ?? 0));
+    const currentPaid = Math.max(0, Math.floor(Number(currentEventData?.eventTransfersCost ?? 0) / 4));
+    const currentFreeUsed = Math.max(0, currentTransfers - currentPaid);
+    // If we used fewer than 2 free transfers this GW, 0 remaining is typically a stale-history artifact.
+    if (currentFreeUsed <= 1) {
+      return 1;
+    }
+  }
+
+  return ftEndPrev;
+}
+
+async function loadEntryLeagueData(entryId, eventId) {
+  const key = `${entryId}:${eventId}`;
+  if (leagueDataCache.has(key)) return leagueDataCache.get(key);
+  if (leagueDataPending.has(key)) return leagueDataPending.get(key);
+
+  const p = (async () => {
+    try {
+      const localMyEntryId = await loadMyEntryId();
+      const shouldLoadMyTeam = Number(entryId) === Number(localMyEntryId);
+      const [picksRes, historyData, transfersData, myTeamCurrent, myTeamNext, htmlFt] = await Promise.all([
+        fetch(`${BASE}/entry/${entryId}/event/${eventId}/picks/`),
+        loadEntryHistory(entryId),
+        loadEntryTransfers(entryId),
+        shouldLoadMyTeam ? loadMyTeamTransfers(entryId, eventId) : Promise.resolve(null),
+        shouldLoadMyTeam && Number.isFinite(Number(nextEventId))
+          ? loadMyTeamTransfers(entryId, nextEventId)
+          : Promise.resolve(null),
+        shouldLoadMyTeam ? loadMyFreeTransfersFromTransfersHtml() : Promise.resolve(null)
+      ]);
+      const res = picksRes;
       if (!res.ok) throw new Error(`entry picks failed ${entryId}/${eventId}: HTTP ${res.status}`);
       const data = await res.json();
       const picks = Array.isArray(data?.picks) ? data.picks : [];
       const cap = picks.find((x) => x && x.is_captain);
-      const elementId = Number(cap?.element);
-      const name = playerById[elementId]?.web_name || (Number.isFinite(elementId) ? `#${elementId}` : "n/a");
-      captainCache.set(key, name);
-      return name;
+      const vc = picks.find((x) => x && x.is_vice_captain);
+      const capId = Number(cap?.element);
+      const vcId = Number(vc?.element);
+      const captain = playerById[capId]?.web_name || (Number.isFinite(capId) ? `#${capId}` : "n/a");
+      const viceCaptain = playerById[vcId]?.web_name || (Number.isFinite(vcId) ? `#${vcId}` : "n/a");
+
+      const rawChip = String(data?.active_chip || "").trim();
+      const chip = formatChip(rawChip);
+      const transferCost = Number(data?.entry_history?.event_transfers_cost ?? 0);
+      const transfersMadeRaw = Number(data?.entry_history?.event_transfers ?? 0);
+      const transfersMade = Number.isFinite(transfersMadeRaw) ? transfersMadeRaw : 0;
+      const remainingTransfers = computeRemainingTransfers(historyData, eventId, {
+        activeChipRaw: rawChip,
+        eventTransfers: transfersMade,
+        eventTransfersCost: transferCost
+      });
+      const exactRemainingCurrent =
+        myTeamCurrent && Number.isFinite(myTeamCurrent.remaining)
+          ? Number(myTeamCurrent.remaining)
+          : null;
+      const exactRemainingNext =
+        myTeamNext && Number.isFinite(myTeamNext.remaining)
+          ? Number(myTeamNext.remaining)
+          : null;
+      const exactRemainingProjected =
+        Number.isFinite(exactRemainingCurrent)
+          ? Math.min(5, Math.max(0, exactRemainingCurrent + 1))
+          : null;
+      const calcRemaining = remainingTransfers == null ? null : Number(remainingTransfers);
+      const cachedFt = shouldLoadMyTeam ? getCachedMyFreeTransfers() : null;
+      const memoryRemaining =
+        shouldLoadMyTeam && Number.isFinite(Number(myFreeTransfersMemory))
+          ? Number(myFreeTransfersMemory)
+          : null;
+      const cachedRemaining =
+        cachedFt &&
+        Number.isFinite(cachedFt.value) &&
+        (cachedFt.entryId == null || Number(cachedFt.entryId) === Number(entryId))
+          ? Number(cachedFt.value)
+          : null;
+      const htmlRemaining = Number.isFinite(Number(htmlFt)) ? Number(htmlFt) : null;
+      const manualRemaining = shouldLoadMyTeam && Number.isFinite(Number(MANUAL_MY_REMAINING_FT))
+        ? Number(MANUAL_MY_REMAINING_FT)
+        : null;
+      // Some unauthenticated/partial sources return 0; treat those as unreliable
+      // when we know transfers were made this GW.
+      const ignoreZeroFromFallbacks = transfersMade > 0;
+      const safeCur = ignoreZeroFromFallbacks && exactRemainingCurrent === 0 ? null : exactRemainingCurrent;
+      const safeNext = ignoreZeroFromFallbacks && exactRemainingNext === 0 ? null : exactRemainingNext;
+      const safeProj = ignoreZeroFromFallbacks && exactRemainingProjected === 0 ? null : exactRemainingProjected;
+      const safeMem = ignoreZeroFromFallbacks && memoryRemaining === 0 ? null : memoryRemaining;
+      const safeCache = ignoreZeroFromFallbacks && cachedRemaining === 0 ? null : cachedRemaining;
+      const safeHtml = ignoreZeroFromFallbacks && htmlRemaining === 0 ? null : htmlRemaining;
+      const mergedRemaining =
+        shouldLoadMyTeam
+          ? [manualRemaining, safeCur, safeNext, safeProj, safeMem, safeCache, safeHtml, calcRemaining]
+              .filter((v) => Number.isFinite(v))
+              .reduce((max, v) => Math.max(max, v), -1)
+          : (Number.isFinite(calcRemaining) ? calcRemaining : -1);
+      const ftDebug = shouldLoadMyTeam
+        ? `FTdbg my=${entryId} ev=${eventId} next=${nextEventId} calc=${calcRemaining} cur=${exactRemainingCurrent} nextVal=${exactRemainingNext} proj=${exactRemainingProjected} mem=${memoryRemaining} cache=${cachedRemaining} html=${htmlRemaining} manual=${manualRemaining} merged=${mergedRemaining} t=${transfersMade} cost=${transferCost} chip=${chip}`
+        : null;
+
+      const eventTransfers = Array.isArray(transfersData)
+        ? transfersData.filter((t) => Number(t?.event) === Number(eventId))
+        : [];
+      eventTransfers.sort((a, b) => {
+        const at = Date.parse(String(a?.time || "")) || 0;
+        const bt = Date.parse(String(b?.time || "")) || 0;
+        return at - bt;
+      });
+      const transferLines = eventTransfers.map((t) => {
+        const outId = Number(t?.element_out);
+        const inId = Number(t?.element_in);
+        const outName = playerById[outId]?.web_name || (Number.isFinite(outId) ? `#${outId}` : "?");
+        const inName = playerById[inId]?.web_name || (Number.isFinite(inId) ? `#${inId}` : "?");
+        return `${outName} -> ${inName}`;
+      });
+
+      const out = {
+        captain,
+        viceCaptain,
+        chip,
+        transferCost,
+        transfersMade,
+        remainingTransfers: mergedRemaining < 0 ? (remainingTransfers == null ? "n/a" : remainingTransfers) : mergedRemaining,
+        transferLines,
+        ftDebug
+      };
+      leagueDataCache.set(key, out);
+      return out;
     } catch (e) {
-      debugLog("loadEntryCaptain failed", entryId, eventId, e);
-      captainCache.set(key, "n/a");
-      return "n/a";
+      debugLog("loadEntryLeagueData failed", entryId, eventId, e);
+      const out = {
+        captain: "n/a",
+        viceCaptain: "n/a",
+        chip: "none",
+        transferCost: 0,
+        transfersMade: 0,
+        remainingTransfers: "n/a",
+        transferLines: [],
+        ftDebug: null
+      };
+      leagueDataCache.set(key, out);
+      return out;
     } finally {
-      captainPending.delete(key);
+      leagueDataPending.delete(key);
     }
   })();
 
-  captainPending.set(key, p);
+  leagueDataPending.set(key, p);
   return p;
+}
+
+function formatChip(rawChip) {
+  if (!rawChip) return "none";
+  const map = {
+    "3xc": "TC",
+    "bboost": "BB",
+    "freehit": "FH",
+    "wildcard": "WC",
+    "manager": "AM"
+  };
+  return map[rawChip] || rawChip.toUpperCase();
 }
 
 function getActiveViews(pathname) {
@@ -415,6 +1053,13 @@ function getActiveViews(pathname) {
 }
 
 async function scanPitchNameBadges(viewId) {
+  if (viewId === "transfers") {
+    const ft = scrapeFreeTransfersFromTransfersPage();
+    if (Number.isFinite(ft)) {
+      setCachedMyFreeTransfers(ft);
+    }
+  }
+
   // First try: known selectors (may change as FPL deploys new UI)
   const nameNodes = document.querySelectorAll(NAME_SELECTORS);
 
@@ -497,9 +1142,7 @@ async function scanLeagueStandingsCaptains(viewId) {
 
   const rows = getStandingsRows();
   if (rows.length === 0) return;
-  cleanupStrayCaptainInline();
-  ensureCaptainHeader();
-  applyLeagueGridLayout();
+  cleanupCaptainInjections();
 
   const jobs = [];
   for (const row of rows) {
@@ -512,8 +1155,8 @@ async function scanLeagueStandingsCaptains(viewId) {
   if (jobs.length === 0) return;
 
   await mapWithConcurrency(jobs, CAPTAIN_FETCH_CONCURRENCY, async (job) => {
-    const captain = await loadEntryCaptain(job.entryId, currentEventId);
-    injectCaptainIntoRow(job.row, captain, currentEventId);
+    const leagueData = await loadEntryLeagueData(job.entryId, currentEventId);
+    injectLeagueMetaIntoTeamCell(job.row, leagueData, currentEventId);
   });
 
   debugLog(`[${viewId}] captain cells updated:`, jobs.length);
