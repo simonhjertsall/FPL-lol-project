@@ -50,6 +50,19 @@ let scanInProgress = false;
 let scanQueued = false;
 let scheduledTimer = null;
 
+// Differential Analysis State
+let miniLeagueOwnershipCache = new Map(); // eventId -> OwnershipData
+let miniLeagueOwnershipPending = new Map(); // eventId -> Promise<OwnershipData>
+let myCurrentTeamCache = new Map(); // eventId -> Set<playerId>
+let myCurrentTeamPending = new Map(); // eventId -> Promise<Set<playerId>>
+
+// Ownership Thresholds for Differential Analysis
+const OWNERSHIP_THRESHOLDS = {
+  template: 60,      // >60% = template player
+  differential: 30,  // <30% = differential
+  threat: 60         // Don't own but >60% of rivals do
+};
+
 const VIEWS = [
   {
     id: "my-team",
@@ -70,6 +83,11 @@ const VIEWS = [
     id: "leagues-standings",
     matchRoute: (path) => /^\/leagues\/\d+\/standings\/[^/]+(?:\/|$)/.test(path),
     scan: scanLeagueStandingsCaptains
+  },
+  {
+    id: "my-team-insights",
+    matchRoute: (path) => /^\/my-team(?:\/|$)/.test(path),
+    scan: scanMyTeamInsights
   }
 ];
 
@@ -408,6 +426,47 @@ async function injectUnderName(el) {
     if (!fixturesLoaded) await loadFixtures();
     const nextFixtures = getNextFixturesForPlayer(id, 5);
 
+    // Load mini-league ownership data
+    const ownershipData = Number.isFinite(Number(currentEventId))
+      ? await loadMiniLeagueOwnership(currentEventId)
+      : { playerOwnership: new Map(), rivalTeams: new Map(), totalRivals: 0 };
+    const myTeam = Number.isFinite(Number(currentEventId))
+      ? await loadMyCurrentTeam(currentEventId)
+      : new Set();
+
+    // Get ownership data - if player not in map, they have 0% ownership
+    const playerOwn = ownershipData?.playerOwnership?.get(id);
+    const mlOwnership = Number.isFinite(playerOwn?.ownershipPct) ? playerOwn.ownershipPct : 0;
+    const mlOwnText = formatPercent(mlOwnership);
+    const iOwnPlayer = myTeam && myTeam.size > 0 ? myTeam.has(id) : false;
+
+    // Determine differential/template/threat status
+    // Note: Players not in the ownership map have 0% ownership (no rivals own them)
+    let diffBadge = "";
+
+    // Only show badges if we have ownership data loaded (totalRivals > 0)
+    if (ownershipData?.totalRivals > 0) {
+      if (iOwnPlayer) {
+        // I own this player
+        if (mlOwnership < OWNERSHIP_THRESHOLDS.differential) {
+          // DIFF: Low ownership (<30%)
+          diffBadge = `<span style="background:#22c55e;color:#0b1020;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">DIFF</span><br />`;
+        } else if (mlOwnership > OWNERSHIP_THRESHOLDS.template) {
+          // TEMPLATE: High ownership (>60%)
+          diffBadge = `<span style="background:#fbbf24;color:#0b1020;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">TEMPLATE</span><br />`;
+        } else {
+          // MID: Medium ownership (30-60%)
+          diffBadge = `<span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">MID</span><br />`;
+        }
+      } else {
+        // I DON'T own this player
+        if (mlOwnership > OWNERSHIP_THRESHOLDS.threat) {
+          // THREAT: High ownership (>60%) but I don't own
+          diffBadge = `<span style="background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">THREAT</span><br />`;
+        }
+      }
+    }
+
     // If another scan already inserted the badge while we awaited, just exit.
     const nowExists = container.querySelector(`.fpl-xg-badge[data-player-id="${id}"]`);
     if (nowExists) return;
@@ -458,7 +517,9 @@ async function injectUnderName(el) {
              <span style="color:#cbd5e1">SP: ${stats.savePoints5}</span><br />
              <span style="color:#cbd5e1">xGC/match: ${stats.hasXGC ? Number(stats.xgcPerMatch5).toFixed(2) : "n/a"}</span><br />`
         : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
-      <span style="color:#cbd5e1">EO: ${eoText}</span>
+      <span style="color:#cbd5e1">EO: ${eoText}</span><br />
+      <span style="color:#cbd5e1">ML Own: ${mlOwnText}</span><br />
+      ${diffBadge}
       ${fixtureHtml}
     `;
 
@@ -601,6 +662,286 @@ async function loadLeagueEOForEvent(eventId) {
 
   leagueEoPending.set(ev, p);
   return p;
+}
+
+async function loadMiniLeagueOwnership(eventId) {
+  const ev = Number(eventId);
+  if (!Number.isFinite(ev) || ev < 1) {
+    return { playerOwnership: new Map(), rivalTeams: new Map(), totalRivals: 0 };
+  }
+
+  if (miniLeagueOwnershipCache.has(ev)) return miniLeagueOwnershipCache.get(ev);
+  if (miniLeagueOwnershipPending.has(ev)) return miniLeagueOwnershipPending.get(ev);
+
+  const p = (async () => {
+    try {
+      // Get user's entry ID to exclude from rivals
+      const myIdFromApi = await loadMyEntryId();
+      const myIdFromNav = getMyEntryIdFromNav();
+      const myIdFromCache = Number(getCachedMyFreeTransfers()?.entryId);
+      const myId = [myIdFromApi, myIdFromNav, myIdFromCache]
+        .map((v) => Number(v))
+        .find((v) => Number.isFinite(v) && v > 0);
+
+      // Fetch all league standings
+      const standings = await loadLeagueStandingsEntries(LEAGUE_EO_ID, LEAGUE_EO_RIVALS_LIMIT);
+      const rivals = standings
+        .map((row) => Number(row?.entry))
+        .filter((id) => Number.isFinite(id) && id > 0 && (!Number.isFinite(myId) || Number(id) !== Number(myId)))
+        .slice(0, LEAGUE_EO_RIVALS_LIMIT);
+
+      if (rivals.length === 0) {
+        const empty = { playerOwnership: new Map(), rivalTeams: new Map(), totalRivals: 0 };
+        miniLeagueOwnershipCache.set(ev, empty);
+        return empty;
+      }
+
+      // Build ownership maps
+      const playerOwnershipMap = new Map(); // playerId -> { ownedBy: Set, captainedBy: Set }
+      const rivalTeamsMap = new Map(); // entryId -> { name, picks: Set, captain, viceCaptain, chip }
+      let successfulRivals = 0;
+
+      await mapWithConcurrency(rivals, CAPTAIN_FETCH_CONCURRENCY, async (entryId) => {
+        try {
+          const res = await fetch(`${BASE}/entry/${entryId}/event/${ev}/picks/`);
+          if (!res.ok) return;
+
+          const data = await res.json();
+          const picks = Array.isArray(data?.picks) ? data.picks : [];
+          successfulRivals += 1;
+
+          // Store rival team info
+          const pickIds = new Set();
+          let captainId = null;
+          let viceCaptainId = null;
+
+          for (const pick of picks) {
+            const playerId = Number(pick?.element);
+            if (!Number.isFinite(playerId)) continue;
+
+            pickIds.add(playerId);
+
+            // Initialize ownership tracking for this player
+            if (!playerOwnershipMap.has(playerId)) {
+              playerOwnershipMap.set(playerId, {
+                ownedBy: new Set(),
+                captainedBy: new Set()
+              });
+            }
+
+            // Track ownership
+            playerOwnershipMap.get(playerId).ownedBy.add(entryId);
+
+            // Track captaincy
+            if (pick?.is_captain) {
+              captainId = playerId;
+              playerOwnershipMap.get(playerId).captainedBy.add(entryId);
+            }
+            if (pick?.is_vice_captain) {
+              viceCaptainId = playerId;
+            }
+          }
+
+          rivalTeamsMap.set(entryId, {
+            name: String(data?.entry_history?.entry_name || ""),
+            picks: pickIds,
+            captain: captainId,
+            viceCaptain: viceCaptainId,
+            chip: String(data?.active_chip || "").toLowerCase()
+          });
+        } catch (_) {
+          // Ignore individual rival failures
+        }
+      });
+
+      if (successfulRivals === 0) {
+        const empty = { playerOwnership: new Map(), rivalTeams: new Map(), totalRivals: 0 };
+        miniLeagueOwnershipCache.set(ev, empty);
+        return empty;
+      }
+
+      // Calculate ownership percentages
+      const playerOwnership = new Map();
+      for (const [playerId, data] of playerOwnershipMap.entries()) {
+        const ownershipPct = (data.ownedBy.size / successfulRivals) * 100;
+        const captainPct = (data.captainedBy.size / successfulRivals) * 100;
+        playerOwnership.set(playerId, {
+          ownedBy: data.ownedBy,
+          ownershipPct,
+          captainedBy: data.captainedBy,
+          captainPct
+        });
+      }
+
+      const result = {
+        eventId: ev,
+        totalRivals: successfulRivals,
+        playerOwnership,
+        rivalTeams: rivalTeamsMap
+      };
+      miniLeagueOwnershipCache.set(ev, result);
+      return result;
+    } catch (e) {
+      debugLog("loadMiniLeagueOwnership failed", ev, e);
+      const out = { playerOwnership: new Map(), rivalTeams: new Map(), totalRivals: 0 };
+      miniLeagueOwnershipCache.set(ev, out);
+      return out;
+    } finally {
+      miniLeagueOwnershipPending.delete(ev);
+    }
+  })();
+
+  miniLeagueOwnershipPending.set(ev, p);
+  return p;
+}
+
+async function loadMyCurrentTeam(eventId) {
+  const ev = Number(eventId);
+  if (!Number.isFinite(ev) || ev < 1) return new Set();
+
+  if (myCurrentTeamCache.has(ev)) return myCurrentTeamCache.get(ev);
+  if (myCurrentTeamPending.has(ev)) return myCurrentTeamPending.get(ev);
+
+  const p = (async () => {
+    try {
+      const myId = await loadMyEntryId();
+      if (!Number.isFinite(myId)) {
+        myCurrentTeamCache.set(ev, new Set());
+        return new Set();
+      }
+
+      const res = await fetch(`${BASE}/entry/${myId}/event/${ev}/picks/`);
+      if (!res.ok) {
+        debugLog(`loadMyCurrentTeam failed for event ${ev}: HTTP ${res.status}`);
+        myCurrentTeamCache.set(ev, new Set());
+        return new Set();
+      }
+
+      const data = await res.json();
+      const picks = Array.isArray(data?.picks) ? data.picks : [];
+      const pickIds = new Set();
+
+      for (const pick of picks) {
+        const playerId = Number(pick?.element);
+        if (Number.isFinite(playerId)) {
+          pickIds.add(playerId);
+        }
+      }
+
+      myCurrentTeamCache.set(ev, pickIds);
+      return pickIds;
+    } catch (e) {
+      debugLog("loadMyCurrentTeam failed", ev, e);
+      myCurrentTeamCache.set(ev, new Set());
+      return new Set();
+    } finally {
+      myCurrentTeamPending.delete(ev);
+    }
+  })();
+
+  myCurrentTeamPending.set(ev, p);
+  return p;
+}
+
+async function calculateDifferentialInsights(eventId) {
+  const ev = Number(eventId);
+  if (!Number.isFinite(ev) || ev < 1) {
+    return {
+      myDifferentials: [],
+      templatesMissing: [],
+      myTemplates: [],
+      uniquePicks: 0,
+      differentialCount: 0,
+      templateCount: 0
+    };
+  }
+
+  try {
+    const [ownershipData, myTeam] = await Promise.all([
+      loadMiniLeagueOwnership(ev),
+      loadMyCurrentTeam(ev)
+    ]);
+
+    const myDifferentials = [];
+    const myTemplates = [];
+    let uniquePicks = 0;
+    const templatesMissing = [];
+
+    // Analyze my team
+    for (const playerId of myTeam) {
+      const ownData = ownershipData.playerOwnership.get(playerId);
+      const ownershipPct = ownData?.ownershipPct || 0;
+      const ownedByCount = ownData?.ownedBy?.size || 0;
+
+      if (ownershipPct < OWNERSHIP_THRESHOLDS.differential) {
+        myDifferentials.push({
+          playerId,
+          name: playerById[playerId]?.web_name || `#${playerId}`,
+          ownershipPct,
+          ownedBy: ownedByCount
+        });
+
+        if (ownedByCount === 0) {
+          uniquePicks += 1;
+        }
+      }
+
+      if (ownershipPct > OWNERSHIP_THRESHOLDS.template) {
+        myTemplates.push({
+          playerId,
+          name: playerById[playerId]?.web_name || `#${playerId}`,
+          ownershipPct
+        });
+      }
+    }
+
+    // Find templates I'm missing
+    for (const [playerId, ownData] of ownershipData.playerOwnership.entries()) {
+      if (myTeam.has(playerId)) continue; // I already own this player
+
+      if (ownData.ownershipPct > OWNERSHIP_THRESHOLDS.threat) {
+        // Check if top 3 rivals own this player
+        let ownedByTopRivals = false;
+        // This is a simplified check - in a real scenario we'd track top rivals
+        // For now, we'll mark as high priority if ownership is very high
+        if (ownData.ownershipPct >= 75) {
+          ownedByTopRivals = true;
+        }
+
+        templatesMissing.push({
+          playerId,
+          name: playerById[playerId]?.web_name || `#${playerId}`,
+          ownershipPct: ownData.ownershipPct,
+          ownedBy: ownData.ownedBy.size,
+          ownedByTopRivals
+        });
+      }
+    }
+
+    // Sort lists
+    myDifferentials.sort((a, b) => a.ownershipPct - b.ownershipPct);
+    myTemplates.sort((a, b) => b.ownershipPct - a.ownershipPct);
+    templatesMissing.sort((a, b) => b.ownershipPct - a.ownershipPct);
+
+    return {
+      myDifferentials,
+      templatesMissing,
+      myTemplates,
+      uniquePicks,
+      differentialCount: myDifferentials.length,
+      templateCount: myTemplates.length
+    };
+  } catch (e) {
+    debugLog("calculateDifferentialInsights failed", ev, e);
+    return {
+      myDifferentials: [],
+      templatesMissing: [],
+      myTemplates: [],
+      uniquePicks: 0,
+      differentialCount: 0,
+      templateCount: 0
+    };
+  }
 }
 
 function getCachedMyFreeTransfers() {
@@ -847,7 +1188,7 @@ function cleanupCaptainInjections() {
   document.querySelectorAll(".fpl-captain-header, .fpl-captain-cell, .fpl-captain-inline, .fpl-captain-inline-row, .fpl-league-meta, .fpl-league-transfers, .fpl-league-debug").forEach((n) => n.remove());
 }
 
-function injectLeagueMetaIntoTeamCell(row, data, eventId) {
+function injectLeagueMetaIntoTeamCell(row, data, eventId, diffData) {
   const teamCell = row.querySelector("[role='rowheader'], td:nth-child(2)");
   if (!teamCell) return;
 
@@ -904,6 +1245,37 @@ function injectLeagueMetaIntoTeamCell(row, data, eventId) {
       tWrap.appendChild(more);
     }
     teamCell.appendChild(tWrap);
+  }
+
+  // Add differential stats
+  const existingDiff = teamCell.querySelector(".fpl-league-diff");
+  if (existingDiff) existingDiff.remove();
+  if (diffData) {
+    const diffWrap = document.createElement("div");
+    diffWrap.className = "fpl-league-diff";
+    diffWrap.style.marginTop = "4px";
+    diffWrap.style.fontSize = "10px";
+    diffWrap.style.color = "#cbd5e1";
+
+    const diffStats = document.createElement("div");
+    diffStats.innerHTML = `
+      <span style="color:#22c55e">Diffs: ${diffData.differentialCount}</span> |
+      <span style="color:#fbbf24">Templates: ${diffData.templateCount}</span>
+    `;
+    diffWrap.appendChild(diffStats);
+
+    if (diffData.threatsToYou?.length > 0) {
+      const threatDiv = document.createElement("div");
+      threatDiv.style.color = "#ef4444";
+      threatDiv.style.marginTop = "2px";
+      const names = diffData.threatsToYou.slice(0, 3)
+        .map(p => playerById[p]?.web_name || `#${p}`)
+        .join(", ");
+      threatDiv.textContent = `⚠ Has: ${names}${diffData.threatsToYou.length > 3 ? ` +${diffData.threatsToYou.length - 3} more` : ""}`;
+      diffWrap.appendChild(threatDiv);
+    }
+
+    teamCell.appendChild(diffWrap);
   }
 
   const existingDebug = teamCell.querySelector(".fpl-league-debug");
@@ -1297,6 +1669,37 @@ async function scanPitchNameBadges(viewId) {
   debugLog(`[${viewId}] fallback matched name nodes:`, matched);
 }
 
+function calculateRivalDiffData(rivalTeam, myTeam, ownershipData) {
+  if (!rivalTeam || !myTeam || !ownershipData) return null;
+
+  let differentialCount = 0;
+  let templateCount = 0;
+  const threatsToYou = [];
+
+  for (const playerId of rivalTeam.picks) {
+    const own = ownershipData.playerOwnership.get(playerId);
+    if (own) {
+      if (own.ownershipPct < OWNERSHIP_THRESHOLDS.differential) {
+        differentialCount++;
+      }
+      if (own.ownershipPct > OWNERSHIP_THRESHOLDS.template) {
+        templateCount++;
+      }
+    }
+
+    // Threat: they have it, you don't, and it's high ownership
+    if (!myTeam.has(playerId) && own?.ownershipPct > OWNERSHIP_THRESHOLDS.threat) {
+      threatsToYou.push(playerId);
+    }
+  }
+
+  return {
+    differentialCount,
+    templateCount,
+    threatsToYou
+  };
+}
+
 async function scanLeagueStandingsCaptains(viewId) {
   if (!currentEventId) return;
 
@@ -1314,12 +1717,180 @@ async function scanLeagueStandingsCaptains(viewId) {
   }
   if (jobs.length === 0) return;
 
+  // Load ownership data once for all rivals
+  const ownershipData = await loadMiniLeagueOwnership(currentEventId);
+  const myTeam = await loadMyCurrentTeam(currentEventId);
+
   await mapWithConcurrency(jobs, CAPTAIN_FETCH_CONCURRENCY, async (job) => {
     const leagueData = await loadEntryLeagueData(job.entryId, currentEventId);
-    injectLeagueMetaIntoTeamCell(job.row, leagueData, currentEventId);
+    const rivalTeam = ownershipData?.rivalTeams?.get(job.entryId);
+    const diffData = calculateRivalDiffData(rivalTeam, myTeam, ownershipData);
+    injectLeagueMetaIntoTeamCell(job.row, leagueData, currentEventId, diffData);
   });
 
   debugLog(`[${viewId}] captain cells updated:`, jobs.length);
+}
+
+function getRecommendations(insights) {
+  const recommendations = [];
+
+  if (insights.templatesMissing.length > 0) {
+    const topThreat = insights.templatesMissing[0];
+    recommendations.push(
+      `Consider: ${topThreat.name} is owned by ${formatPercent(topThreat.ownershipPct)} of rivals.`
+    );
+  }
+
+  if (insights.differentialCount === 0) {
+    recommendations.push(
+      "You have no differentials. Consider adding unique picks to gain an edge."
+    );
+  } else if (insights.differentialCount > 5) {
+    recommendations.push(
+      `You have ${insights.differentialCount} differentials - high risk/reward strategy.`
+    );
+  }
+
+  if (insights.uniquePicks > 3) {
+    recommendations.push(
+      `You have ${insights.uniquePicks} unique picks that no rivals own - bold moves!`
+    );
+  }
+
+  return recommendations.length > 0
+    ? recommendations.join('<br />')
+    : 'Your team looks well-balanced against rivals.';
+}
+
+function createInsightsPanel(insights) {
+  const panel = document.createElement("div");
+  panel.className = "fpl-diff-insights-panel";
+  panel.style.cssText = `
+    background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    color: #e2e8f0;
+  `;
+
+  panel.innerHTML = `
+    <h3 style="margin: 0 0 12px 0; font-size: 16px; color: #fff;">
+      Differential Analysis (League ${LEAGUE_EO_ID})
+    </h3>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+      <!-- Summary Stats -->
+      <div style="background: #1e293b; padding: 12px; border-radius: 6px;">
+        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 4px;">Your Differentials</div>
+        <div style="font-size: 24px; font-weight: 700; color: #22c55e;">
+          ${insights.differentialCount}
+        </div>
+        <div style="font-size: 10px; color: #64748b; margin-top: 4px;">
+          ${insights.uniquePicks} unique picks
+        </div>
+      </div>
+
+      <div style="background: #1e293b; padding: 12px; border-radius: 6px;">
+        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 4px;">Templates Missing</div>
+        <div style="font-size: 24px; font-weight: 700; color: ${insights.templatesMissing.length > 0 ? '#ef4444' : '#22c55e'};">
+          ${insights.templatesMissing.length}
+        </div>
+      </div>
+
+      <div style="background: #1e293b; padding: 12px; border-radius: 6px;">
+        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 4px;">Your Templates</div>
+        <div style="font-size: 24px; font-weight: 700; color: #fbbf24;">
+          ${insights.templateCount}
+        </div>
+      </div>
+    </div>
+
+    ${insights.myDifferentials.length > 0 ? `
+      <div style="margin-top: 16px;">
+        <h4 style="font-size: 13px; color: #94a3b8; margin: 0 0 8px 0;">
+          Your Differentials (&lt;${OWNERSHIP_THRESHOLDS.differential}% owned)
+        </h4>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          ${insights.myDifferentials.map(p => `
+            <span style="
+              background: #22c55e;
+              color: #0b1020;
+              padding: 4px 8px;
+              border-radius: 4px;
+              font-size: 11px;
+              font-weight: 600;
+            ">
+              ${p.name} (${formatPercent(p.ownershipPct)})
+            </span>
+          `).join('')}
+        </div>
+      </div>
+    ` : ''}
+
+    ${insights.templatesMissing.length > 0 ? `
+      <div style="margin-top: 16px;">
+        <h4 style="font-size: 13px; color: #94a3b8; margin: 0 0 8px 0;">
+          ⚠ Templates You're Missing (&gt;${OWNERSHIP_THRESHOLDS.threat}% owned)
+        </h4>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          ${insights.templatesMissing.map(p => `
+            <span style="
+              background: ${p.ownedByTopRivals ? '#ef4444' : '#f97316'};
+              color: #fff;
+              padding: 4px 8px;
+              border-radius: 4px;
+              font-size: 11px;
+              font-weight: 600;
+            ">
+              ${p.name} (${formatPercent(p.ownershipPct)})
+              ${p.ownedByTopRivals ? ' 🔥' : ''}
+            </span>
+          `).join('')}
+        </div>
+      </div>
+    ` : ''}
+
+    <div style="margin-top: 16px; padding: 12px; background: #0f172a; border-radius: 6px; border-left: 3px solid #3b82f6;">
+      <div style="font-size: 12px; font-weight: 600; color: #60a5fa; margin-bottom: 6px;">
+        💡 Recommendations
+      </div>
+      <div style="font-size: 11px; color: #cbd5e1; line-height: 1.5;">
+        ${getRecommendations(insights)}
+      </div>
+    </div>
+  `;
+
+  return panel;
+}
+
+async function scanMyTeamInsights(viewId) {
+  if (!currentEventId) return;
+
+  // Find insertion point (before pitch)
+  const pitchContainer = document.querySelector('[data-testid="pitch"]') ||
+                         document.querySelector('.Pitch') ||
+                         document.querySelector('[class*="Pitch"]') ||
+                         document.querySelector('[class*="pitch"]');
+
+  if (!pitchContainer) {
+    debugLog(`[${viewId}] pitch container not found`);
+    return;
+  }
+
+  // Remove old insights panel if exists
+  const existing = document.querySelector('.fpl-diff-insights-panel');
+  if (existing) existing.remove();
+
+  // Calculate insights
+  const insights = await calculateDifferentialInsights(currentEventId);
+
+  // Create insights panel
+  const panel = createInsightsPanel(insights);
+
+  // Insert before pitch
+  pitchContainer.parentElement.insertBefore(panel, pitchContainer);
+  debugLog(`[${viewId}] insights panel injected`);
 }
 
 async function scan() {
@@ -1348,9 +1919,27 @@ async function scan() {
   }
 }
 
+function invalidateOwnershipCaches() {
+  miniLeagueOwnershipCache.clear();
+  myCurrentTeamCache.clear();
+  debugLog("Ownership caches invalidated");
+}
+
 async function init() {
   debugLog("FPL XG running", new Date().toISOString());
   await loadBootstrap();
+
+  // Preload ownership data for current event in background
+  if (Number.isFinite(Number(currentEventId))) {
+    debugLog("Preloading ownership data for event", currentEventId);
+    loadMiniLeagueOwnership(currentEventId).catch(e =>
+      debugLog("Preload ownership failed", e)
+    );
+    loadMyCurrentTeam(currentEventId).catch(e =>
+      debugLog("Preload my team failed", e)
+    );
+  }
+
   await scan();
 }
 
