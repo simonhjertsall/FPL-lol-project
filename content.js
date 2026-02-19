@@ -24,7 +24,7 @@ const SHOW_FT_DEBUG = true;
 let playerMap = {}; // web_name -> { id, element_type }
 let playerById = {}; // id -> { web_name, element_type, team }
 let teamById = {}; // id -> { short_name, name }
-let cache = {};     // id -> { xgi90, mpg5, starts5, games, cs5, dc10Matches5, hasDC, savePoints5, xgcPerMatch5, hasXGC }
+let cache = {};     // `${id}:${eventId|na}` -> { games, cs5, hasDC, dc10Matches5, savePoints5, xgcPerMatch5, hasXGC, xgi90, currentGwXgi, hasCurrentGwXgi, currentGwDc, hasCurrentGwDc, currentGwSaves, currentGwXgc }
 let currentEventId = null;
 let nextEventId = null;
 let fixturesByTeam = new Map(); // teamId -> [{ oppShort, isHome, difficulty, event, kickoff }]
@@ -256,8 +256,11 @@ function getNextEventId(bootstrapData) {
   return null;
 }
 
-async function loadPlayerData(id) {
-  if (cache[id]) return cache[id];
+async function loadPlayerData(id, eventIdForGw = currentEventId) {
+  const ev = Number(eventIdForGw);
+  const evKey = Number.isFinite(ev) && ev > 0 ? String(ev) : "na";
+  const cacheKey = `${Number(id)}:${evKey}`;
+  if (cache[cacheKey]) return cache[cacheKey];
 
   try {
     const res = await fetch(`${BASE}/element-summary/${id}/`);
@@ -281,23 +284,10 @@ async function loadPlayerData(id) {
     // Debug: inspect available fields (uncomment temporarily)
     // if (last5[0]) console.log("history keys sample:", Object.keys(last5[0]));
 
-    // FPL API field names may vary; handle both common variants.
+    const games = last5.length || 1;
+    const min5 = last5.reduce((sum, m) => sum + Number(m.minutes ?? 0), 0);
     const pickXG = (row) => Number(row.xG ?? row.expected_goals ?? 0);
     const pickXA = (row) => Number(row.xA ?? row.expected_assists ?? 0);
-
-    const games = last5.length || 1;
-
-    const min5 = last5.reduce((sum, m) => sum + Number(m.minutes ?? 0), 0);
-    const mpg5 = min5 / games;
-
-    // starts: prefer explicit fields if present; otherwise fallback heuristic.
-    const isStart = (m) => {
-      if (m.starts != null) return Number(m.starts) > 0;
-      if (m.started != null) return Number(m.started) > 0;
-      // conservative fallback: treat 60+ minutes as a start
-      return Number(m.minutes ?? 0) >= 60;
-    };
-    const starts5 = last5.reduce((sum, m) => sum + (isStart(m) ? 1 : 0), 0);
 
     // Clean Sheets over last 5 played matches
     const cs5 = last5.reduce((sum, m) => sum + (Number(m.clean_sheets ?? 0) > 0 ? 1 : 0), 0);
@@ -308,15 +298,13 @@ async function loadPlayerData(id) {
       return sum + Math.floor(saves / 3);
     }, 0);
 
-    // Defensive contributions over the last 5 played matches.
-    // Field name may vary; if missing, we mark hasDC=false and show n/a in UI.
+    // Defensive contributions; field name may vary across API payloads.
     const pickDC = (m) => {
       const v = m.defensive_contribution ?? m.defensive_contributions ?? m.def_contribution;
       if (v == null) return null;
       const n = Number(v);
       return Number.isFinite(n) ? n : null;
     };
-
     let hasDC = false;
     let dc10Matches5 = 0;
     for (const m of last5) {
@@ -325,9 +313,6 @@ async function loadPlayerData(id) {
       hasDC = true;
       if (v >= 10) dc10Matches5 += 1;
     }
-
-    const xg5 = last5.reduce((sum, m) => sum + pickXG(m), 0);
-    const xa5 = last5.reduce((sum, m) => sum + pickXA(m), 0);
     const pickXGC = (row) => {
       const v = row.xGC ?? row.expected_goals_conceded;
       const n = Number(v);
@@ -342,35 +327,50 @@ async function loadPlayerData(id) {
       xgc5 += v;
     }
     const xgcPerMatch5 = games > 0 ? (xgc5 / games) : 0;
-
-    const xgi5 = xg5 + xa5;
+    const gw = ev;
+    const hasCurrentGwXgi = Number.isFinite(gw) && gw > 0;
+    const currentGwRows = hasCurrentGwXgi
+      ? sorted.filter((m) => Number(m.round) === gw)
+      : [];
+    const currentGwXgi = currentGwRows.reduce((sum, m) => sum + pickXG(m) + pickXA(m), 0);
+    const xgi5 = last5.reduce((sum, m) => sum + pickXG(m) + pickXA(m), 0);
     const xgi90 = min5 > 0 ? (xgi5 / (min5 / 90)) : 0;
+    const currentGwDcRows = currentGwRows.map(pickDC).filter((v) => v != null);
+    const hasCurrentGwDc = currentGwDcRows.length > 0;
+    const currentGwDc = hasCurrentGwDc
+      ? currentGwDcRows.reduce((sum, v) => sum + Number(v), 0)
+      : 0;
+    const currentGwSaves = currentGwRows.reduce((sum, m) => {
+      const saves = Number(m.saves ?? 0);
+      return Number.isFinite(saves) ? sum + saves : sum;
+    }, 0);
+    const currentGwXgc = currentGwRows.reduce((sum, m) => {
+      const v = pickXGC(m);
+      return v == null ? sum : sum + v;
+    }, 0);
 
-    cache[id] = {
-      xgi90: xgi90.toFixed(2),
-      mpg5: mpg5.toFixed(1),
-      starts5,
+    cache[cacheKey] = {
       games,
       cs5,
       hasDC,
       dc10Matches5,
       savePoints5,
       xgcPerMatch5: Number(xgcPerMatch5.toFixed(2)),
-      hasXGC
+      hasXGC,
+      xgi90: Number(xgi90.toFixed(2)),
+      currentGwXgi: Number(currentGwXgi.toFixed(2)),
+      hasCurrentGwXgi,
+      currentGwDc: Math.round(currentGwDc),
+      hasCurrentGwDc,
+      currentGwSaves: Math.round(currentGwSaves),
+      currentGwXgc: Number(currentGwXgc.toFixed(2))
     };
 
-    return cache[id];
+    return cache[cacheKey];
   } catch (e) {
     console.error("loadPlayerData failed", id, e);
     return null;
   }
-}
-
-function colorForXGI90(value) {
-  const v = Number(value);
-  if (v >= 0.8) return "#1db954";
-  if (v >= 0.45) return "#e6b800";
-  return "#d11a2a";
 }
 
 function getPlayerCardContainer(el) {
@@ -398,7 +398,7 @@ function endInject(container, playerId) {
   if (set.size === 0) pendingByContainer.delete(container);
 }
 
-async function injectUnderName(el) {
+async function injectUnderName(el, viewId) {
   const name = (el.textContent || "").trim();
   const player = playerMap[name];
   if (!player) return;
@@ -417,27 +417,60 @@ async function injectUnderName(el) {
   }
 
   try {
-    const stats = await loadPlayerData(id);
-    if (!stats) return;
-    const leagueEoData = Number.isFinite(Number(currentEventId))
-      ? await loadLeagueEOForEvent(currentEventId)
-      : { eoByPlayerId: new Map(), rivalsCount: 0 };
-    const eoText = formatPercent(leagueEoData?.eoByPlayerId?.get(id));
-    if (!fixturesLoaded) await loadFixtures();
-    const nextFixtures = getNextFixturesForPlayer(id, 5);
+    const isPointsView = viewId === "entry";
+    const viewedEventId = parseEventIdFromPath(window.location.pathname || "/");
+    const eventIdForView = Number.isFinite(Number(viewedEventId))
+      ? Number(viewedEventId)
+      : Number(currentEventId);
 
-    // Load mini-league ownership data
-    const ownershipData = Number.isFinite(Number(currentEventId))
-      ? await loadMiniLeagueOwnership(currentEventId)
+    const stats = await loadPlayerData(id, eventIdForView);
+    if (!stats) return;
+    let ownershipData = Number.isFinite(Number(eventIdForView))
+      ? await loadMiniLeagueOwnership(eventIdForView)
       : { playerOwnership: new Map(), rivalTeams: new Map(), totalRivals: 0 };
-    const myTeam = Number.isFinite(Number(currentEventId))
-      ? await loadMyCurrentTeam(currentEventId)
+    let myTeam = Number.isFinite(Number(eventIdForView))
+      ? await loadMyCurrentTeam(eventIdForView)
       : new Set();
+
+    // If viewed event has no rival picks data yet, fallback to current event for ML/EO.
+    const canFallbackToCurrent = Number.isFinite(Number(currentEventId))
+      && Number(currentEventId) > 0
+      && Number(currentEventId) !== Number(eventIdForView);
+    const viewedHasOwnershipData = Number(ownershipData?.totalRivals || 0) > 0
+      && ownershipData?.playerOwnership instanceof Map
+      && ownershipData.playerOwnership.size > 0;
+    if (canFallbackToCurrent && !viewedHasOwnershipData) {
+      const [fallbackOwnership, fallbackMyTeam] = await Promise.all([
+        loadMiniLeagueOwnership(currentEventId),
+        loadMyCurrentTeam(currentEventId)
+      ]);
+      if (Number(fallbackOwnership?.totalRivals || 0) > 0) {
+        ownershipData = fallbackOwnership;
+        myTeam = fallbackMyTeam;
+      }
+    }
 
     // Get ownership data - if player not in map, they have 0% ownership
     const playerOwn = ownershipData?.playerOwnership?.get(id);
     const mlOwnership = Number.isFinite(playerOwn?.ownershipPct) ? playerOwn.ownershipPct : 0;
-    const mlOwnText = formatPercent(mlOwnership);
+    const totalRivals = Number(ownershipData?.totalRivals || 0);
+    let capCount = 0;
+    let tripleCapCount = 0;
+    if (totalRivals > 0 && ownershipData?.rivalTeams instanceof Map) {
+      for (const team of ownershipData.rivalTeams.values()) {
+        const capId = Number(team?.captain);
+        if (!Number.isFinite(capId) || capId !== Number(id)) continue;
+        capCount += 1;
+        if (String(team?.chip || "").toLowerCase() === "3xc") {
+          tripleCapCount += 1;
+        }
+      }
+    }
+    const eoPct = totalRivals > 0
+      ? mlOwnership + ((capCount + tripleCapCount) / totalRivals) * 100
+      : null;
+    const eoText = Number.isFinite(eoPct) ? `${Math.round(eoPct)}%` : "n/a";
+    const mlOwnText = Number.isFinite(mlOwnership) ? `${Math.round(mlOwnership)}%` : "n/a";
     const iOwnPlayer = myTeam && myTeam.size > 0 ? myTeam.has(id) : false;
 
     // Determine differential/template/threat status
@@ -481,44 +514,63 @@ async function injectUnderName(el) {
     div.style.marginTop = "2px";
     div.style.fontWeight = "600";
 
-    const isGk = element_type === 1; // 1 = Goalkeeper in FPL API
-    const isDef = element_type === 2; // 2 = Defender in FPL API
-
-    const fixtureHtml = nextFixtures.length > 0
-      ? `
-        <div style="margin-top:2px; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:2px; max-width:100%;">
-          ${nextFixtures.map((f) => {
-            const label = String(f.oppShort || "?").toLowerCase();
-            return `<span style="
-              display:block;
-              min-width:0;
-              text-align:center;
-              padding:1px 0;
-              border-radius:3px;
-              font-size:8px;
-              line-height:1.15;
-              white-space:nowrap;
-              overflow:hidden;
-              text-overflow:ellipsis;
-              color:#0b1020;
-              background:${fixtureBgByDifficulty(f.difficulty)};
-            ">${label}</span>`;
-          }).join("")}
-        </div>
-      `
-      : "";
+    const isGk = element_type === 1; // 1 = GK
+    const isDef = element_type === 2; // 2 = DEF
+    const isMid = element_type === 3; // 3 = MID
+    const isFwd = element_type === 4; // 4 = FWD
+    let fixtureHtml = "";
+    if (!isPointsView) {
+      if (!fixturesLoaded) await loadFixtures();
+      const nextFixtures = getNextFixturesForPlayer(id, 5);
+      fixtureHtml = nextFixtures.length > 0
+        ? `
+          <div style="margin-top:2px; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:2px; max-width:100%;">
+            ${nextFixtures.map((f) => {
+              const label = String(f.oppShort || "?").toLowerCase();
+              return `<span style="
+                display:block;
+                min-width:0;
+                text-align:center;
+                padding:1px 0;
+                border-radius:3px;
+                font-size:8px;
+                line-height:1.15;
+                white-space:nowrap;
+                overflow:hidden;
+                text-overflow:ellipsis;
+                color:#0b1020;
+                background:${fixtureBgByDifficulty(f.difficulty)};
+              ">${label}</span>`;
+            }).join("")}
+          </div>
+        `
+        : "";
+    }
 
     div.innerHTML = `
-      ${isDef
-        ? `<span style="color:#cbd5e1">CS: ${stats.cs5}/5</span><br />
-           <span style="color:#cbd5e1">DC: ${stats.hasDC ? `${stats.dc10Matches5}/5` : "n/a"}</span><br />`
-        : isGk
+      ${isPointsView && isGk
+        ? `<span style="color:#cbd5e1">Saves: ${stats.hasCurrentGwXgi ? stats.currentGwSaves : "n/a"}</span><br />
+           <span style="color:#cbd5e1">xGC: ${stats.hasCurrentGwXgi ? stats.currentGwXgc.toFixed(2) : "n/a"}</span><br />`
+        : ``}
+      ${isPointsView && (isMid || isFwd)
+        ? `<span style="color:#cbd5e1">xGI: ${stats.hasCurrentGwXgi ? stats.currentGwXgi.toFixed(2) : "n/a"}</span><br />`
+        : ``}
+      ${isPointsView && (isMid || isDef)
+        ? `<span style="color:#cbd5e1">DC: ${stats.hasCurrentGwDc ? stats.currentGwDc : "n/a"}</span><br />`
+        : ``}
+      ${!isPointsView
+        ? (isDef
           ? `<span style="color:#cbd5e1">CS: ${stats.cs5}/5</span><br />
-             <span style="color:#cbd5e1">SP: ${stats.savePoints5}</span><br />
-             <span style="color:#cbd5e1">xGC/match: ${stats.hasXGC ? Number(stats.xgcPerMatch5).toFixed(2) : "n/a"}</span><br />`
-        : `<span style="color:${colorForXGI90(stats.xgi90)}">xGI/90: ${stats.xgi90}</span><br />`}
-      <span style="color:#cbd5e1">EO: ${eoText}</span><br />
-      <span style="color:#cbd5e1">ML Own: ${mlOwnText}</span><br />
+             <span style="color:#cbd5e1">DC: ${stats.hasDC ? `${stats.dc10Matches5}/5` : "n/a"}</span><br />`
+          : isGk
+            ? `<span style="color:#cbd5e1">CS: ${stats.cs5}/5</span><br />
+               <span style="color:#cbd5e1">SP: ${stats.savePoints5}</span><br />
+               <span style="color:#cbd5e1">xGC/match: ${stats.hasXGC ? Number(stats.xgcPerMatch5).toFixed(2) : "n/a"}</span><br />`
+            : `<span style="color:#cbd5e1">xGI/90: ${stats.xgi90.toFixed(2)}</span><br />`)
+        : ``}
+      ${isPointsView
+        ? `<span style="color:#cbd5e1">ML/EO: ${mlOwnText}/${eoText}</span><br />`
+        : `<span style="color:#cbd5e1">ML/EO: ${mlOwnText}/${eoText}</span><br />`}
       ${diffBadge}
       ${fixtureHtml}
     `;
@@ -544,6 +596,13 @@ function parseEntryIdFromHref(href) {
   const m = String(href || "").match(/\/entry\/(\d+)(?:\/|$)/);
   if (!m) return null;
   return Number(m[1]);
+}
+
+function parseEventIdFromPath(pathname) {
+  const m = String(pathname || "").match(/\/event\/(\d+)(?:\/|$)/);
+  if (!m) return null;
+  const ev = Number(m[1]);
+  return Number.isFinite(ev) && ev > 0 ? ev : null;
 }
 
 function formatPercent(value) {
@@ -587,9 +646,10 @@ async function loadLeagueEOForEvent(eventId) {
   const p = (async () => {
     try {
       const myIdFromApi = await loadMyEntryId();
+      const myIdFromPath = getMyEntryIdFromPath();
       const myIdFromNav = getMyEntryIdFromNav();
       const myIdFromCache = Number(getCachedMyFreeTransfers()?.entryId);
-      const myId = [myIdFromApi, myIdFromNav, myIdFromCache]
+      const myId = [myIdFromApi, myIdFromPath, myIdFromNav, myIdFromCache]
         .map((v) => Number(v))
         .find((v) => Number.isFinite(v) && v > 0);
       const standings = await loadLeagueStandingsEntries(LEAGUE_EO_ID, LEAGUE_EO_RIVALS_LIMIT);
@@ -677,9 +737,10 @@ async function loadMiniLeagueOwnership(eventId) {
     try {
       // Get user's entry ID to exclude from rivals
       const myIdFromApi = await loadMyEntryId();
+      const myIdFromPath = getMyEntryIdFromPath();
       const myIdFromNav = getMyEntryIdFromNav();
       const myIdFromCache = Number(getCachedMyFreeTransfers()?.entryId);
-      const myId = [myIdFromApi, myIdFromNav, myIdFromCache]
+      const myId = [myIdFromApi, myIdFromPath, myIdFromNav, myIdFromCache]
         .map((v) => Number(v))
         .find((v) => Number.isFinite(v) && v > 0);
 
@@ -697,7 +758,7 @@ async function loadMiniLeagueOwnership(eventId) {
       }
 
       // Build ownership maps
-      const playerOwnershipMap = new Map(); // playerId -> { ownedBy: Set, captainedBy: Set }
+      const playerOwnershipMap = new Map(); // playerId -> { ownedBy: Set, captainedBy: Set, tripleCaptainedBy: Set }
       const rivalTeamsMap = new Map(); // entryId -> { name, picks: Set, captain, viceCaptain, chip }
       let successfulRivals = 0;
 
@@ -725,7 +786,8 @@ async function loadMiniLeagueOwnership(eventId) {
             if (!playerOwnershipMap.has(playerId)) {
               playerOwnershipMap.set(playerId, {
                 ownedBy: new Set(),
-                captainedBy: new Set()
+                captainedBy: new Set(),
+                tripleCaptainedBy: new Set()
               });
             }
 
@@ -749,6 +811,12 @@ async function loadMiniLeagueOwnership(eventId) {
             viceCaptain: viceCaptainId,
             chip: String(data?.active_chip || "").toLowerCase()
           });
+
+          // Triple captain contributes one extra EO unit on top of captaincy.
+          if (Number.isFinite(Number(captainId)) && String(data?.active_chip || "").toLowerCase() === "3xc") {
+            const capData = playerOwnershipMap.get(Number(captainId));
+            if (capData) capData.tripleCaptainedBy.add(entryId);
+          }
         } catch (_) {
           // Ignore individual rival failures
         }
@@ -765,11 +833,16 @@ async function loadMiniLeagueOwnership(eventId) {
       for (const [playerId, data] of playerOwnershipMap.entries()) {
         const ownershipPct = (data.ownedBy.size / successfulRivals) * 100;
         const captainPct = (data.captainedBy.size / successfulRivals) * 100;
+        const tripleCaptainPct = (data.tripleCaptainedBy.size / successfulRivals) * 100;
+        const eoPct = ownershipPct + captainPct + tripleCaptainPct;
         playerOwnership.set(playerId, {
           ownedBy: data.ownedBy,
           ownershipPct,
           captainedBy: data.captainedBy,
-          captainPct
+          captainPct,
+          tripleCaptainedBy: data.tripleCaptainedBy,
+          tripleCaptainPct,
+          eoPct
         });
       }
 
@@ -1075,12 +1148,24 @@ function getMyEntryIdFromNav() {
   return Number.isFinite(id) ? id : null;
 }
 
+function getMyEntryIdFromPath() {
+  if (Number.isFinite(myEntryId)) return myEntryId;
+  const id = parseEntryIdFromHref(window.location.pathname || "");
+  if (Number.isFinite(id)) myEntryId = id;
+  return Number.isFinite(id) ? id : null;
+}
+
 async function loadMyEntryId() {
   if (Number.isFinite(myEntryId)) return myEntryId;
   if (myEntryIdPending) return myEntryIdPending;
 
   const p = (async () => {
     try {
+      const pathId = getMyEntryIdFromPath();
+      if (Number.isFinite(pathId)) {
+        return pathId;
+      }
+
       const navId = getMyEntryIdFromNav();
       if (Number.isFinite(navId)) {
         return navId;
@@ -1609,7 +1694,7 @@ async function scanPitchNameBadges(viewId) {
       if (!playerMap[name]) continue;
       targets.push(el);
     }
-    await mapWithConcurrency(targets, 6, injectUnderName);
+    await mapWithConcurrency(targets, 6, (el) => injectUnderName(el, viewId));
     return;
   }
 
@@ -1662,7 +1747,7 @@ async function scanPitchNameBadges(viewId) {
     targets.push(el);
     if (targets.length >= MAX_FALLBACK_TARGETS) break;
   }
-  await mapWithConcurrency(targets, 6, injectUnderName);
+  await mapWithConcurrency(targets, 6, (el) => injectUnderName(el, viewId));
   if (matched > 0) {
     lastFallbackSuccessByView.set(viewId, Date.now());
   }
