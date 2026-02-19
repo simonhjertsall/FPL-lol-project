@@ -1,5 +1,5 @@
 const BASE = "https://fantasy.premierleague.com/api";
-const DEBUG = false;
+const DEBUG = true;
 const FALLBACK_SCAN_MIN_INTERVAL_MS = 2500;
 const SCHEDULE_DELAY_MS = 200;
 const MAX_FALLBACK_TARGETS = 120;
@@ -22,7 +22,7 @@ const LEAGUE_DATAPOINTS = [
 const SHOW_FT_DEBUG = true;
 
 let playerMap = {}; // web_name -> { id, element_type }
-let playerById = {}; // id -> { web_name, element_type, team }
+let playerById = {}; // id -> { web_name, element_type, team, ep_next, ep_this, form, now_cost }
 let teamById = {}; // id -> { short_name, name }
 let cache = {};     // `${id}:${eventId|na}` -> { games, cs5, hasDC, dc10Matches5, savePoints5, xgcPerMatch5, hasXGC, xgi90, currentGwXgi, hasCurrentGwXgi, currentGwDc, hasCurrentGwDc, currentGwSaves, currentGwXgc }
 let currentEventId = null;
@@ -151,7 +151,11 @@ async function loadBootstrap() {
       playerById[p.id] = {
         web_name: p.web_name,
         element_type: p.element_type,
-        team: Number(p.team)
+        team: Number(p.team),
+        ep_next: Number(p.ep_next) || 0,
+        ep_this: Number(p.ep_this) || 0,
+        form: Number(p.form) || 0,
+        now_cost: Number(p.now_cost) || 0
       };
     });
     currentEventId = getCurrentEventId(data);
@@ -380,6 +384,10 @@ function getPlayerCardContainer(el) {
   );
 }
 
+function colorForXPts(value) {
+  return "#cbd5e1";  // Neutral gray for all values
+}
+
 function beginInject(container, playerId) {
   let set = pendingByContainer.get(container);
   if (!set) {
@@ -456,15 +464,21 @@ async function injectUnderName(el, viewId) {
     const totalRivals = Number(ownershipData?.totalRivals || 0);
     let capCount = 0;
     let tripleCapCount = 0;
+    const captainEntries = []; // Track which entries have this player as captain
     if (totalRivals > 0 && ownershipData?.rivalTeams instanceof Map) {
-      for (const team of ownershipData.rivalTeams.values()) {
+      for (const [entryId, team] of ownershipData.rivalTeams.entries()) {
         const capId = Number(team?.captain);
         if (!Number.isFinite(capId) || capId !== Number(id)) continue;
         capCount += 1;
+        captainEntries.push(entryId);
         if (String(team?.chip || "").toLowerCase() === "3xc") {
           tripleCapCount += 1;
         }
       }
+    }
+    // Debug log to show who has this player as captain
+    if (capCount > 0) {
+      debugLog(`${name} is captain in ${capCount} team(s): Entry IDs = ${captainEntries.join(', ')}`);
     }
     const eoPct = totalRivals > 0
       ? mlOwnership + ((capCount + tripleCapCount) / totalRivals) * 100
@@ -480,22 +494,28 @@ async function injectUnderName(el, viewId) {
     // Only show badges if we have ownership data loaded (totalRivals > 0)
     if (ownershipData?.totalRivals > 0) {
       if (iOwnPlayer) {
-        // I own this player
+        // I own this player - always show a badge with ML%
         if (mlOwnership < OWNERSHIP_THRESHOLDS.differential) {
           // DIFF: Low ownership (<30%)
-          diffBadge = `<span style="background:#22c55e;color:#0b1020;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">DIFF</span><br />`;
+          diffBadge = `<span style="background:#22c55e;color:#0b1020;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">DIFF - ${Math.round(mlOwnership)}%</span><br />`;
         } else if (mlOwnership > OWNERSHIP_THRESHOLDS.template) {
           // TEMPLATE: High ownership (>60%)
-          diffBadge = `<span style="background:#fbbf24;color:#0b1020;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">TEMPLATE</span><br />`;
+          diffBadge = `<span style="background:#fbbf24;color:#0b1020;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">TEMPLATE - ${Math.round(mlOwnership)}%</span><br />`;
         } else {
           // MID: Medium ownership (30-60%)
-          diffBadge = `<span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">MID</span><br />`;
+          diffBadge = `<span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">MID - ${Math.round(mlOwnership)}%</span><br />`;
         }
       } else {
-        // I DON'T own this player
+        // I DON'T own this player - always show a badge with ML%
         if (mlOwnership > OWNERSHIP_THRESHOLDS.threat) {
           // THREAT: High ownership (>60%) but I don't own
-          diffBadge = `<span style="background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">THREAT</span><br />`;
+          diffBadge = `<span style="background:#ef4444;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">THREAT - ${Math.round(mlOwnership)}%</span><br />`;
+        } else if (mlOwnership >= OWNERSHIP_THRESHOLDS.differential) {
+          // MID: Medium ownership (30-60%) but I don't own
+          diffBadge = `<span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">MID - ${Math.round(mlOwnership)}%</span><br />`;
+        } else {
+          // LOW: Low ownership (<30%) and I don't own
+          diffBadge = `<span style="background:#64748b;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700">LOW - ${Math.round(mlOwnership)}%</span><br />`;
         }
       }
     }
@@ -547,6 +567,11 @@ async function injectUnderName(el, viewId) {
         : "";
     }
 
+    // Calculate predicted points for next GW
+    const xPtsValue = Number(playerById[id]?.ep_next || 0);
+    const xPtsText = xPtsValue > 0 ? xPtsValue.toFixed(1) : "n/a";
+    const xPtsColor = colorForXPts(xPtsValue);
+
     div.innerHTML = `
       ${isPointsView && isGk
         ? `<span style="color:#cbd5e1">Saves: ${stats.hasCurrentGwXgi ? stats.currentGwSaves : "n/a"}</span><br />
@@ -568,9 +593,7 @@ async function injectUnderName(el, viewId) {
                <span style="color:#cbd5e1">xGC/match: ${stats.hasXGC ? Number(stats.xgcPerMatch5).toFixed(2) : "n/a"}</span><br />`
             : `<span style="color:#cbd5e1">xGI/90: ${stats.xgi90.toFixed(2)}</span><br />`)
         : ``}
-      ${isPointsView
-        ? `<span style="color:#cbd5e1">ML/EO: ${mlOwnText}/${eoText}</span><br />`
-        : `<span style="color:#cbd5e1">ML/EO: ${mlOwnText}/${eoText}</span><br />`}
+      <span style="color:${xPtsColor}">xPts: ${xPtsText}</span><br />
       ${diffBadge}
       ${fixtureHtml}
     `;
@@ -925,7 +948,8 @@ async function calculateDifferentialInsights(eventId) {
       myTemplates: [],
       uniquePicks: 0,
       differentialCount: 0,
-      templateCount: 0
+      templateCount: 0,
+      myTeam: new Set()
     };
   }
 
@@ -1002,7 +1026,8 @@ async function calculateDifferentialInsights(eventId) {
       myTemplates,
       uniquePicks,
       differentialCount: myDifferentials.length,
-      templateCount: myTemplates.length
+      templateCount: myTemplates.length,
+      myTeam
     };
   } catch (e) {
     debugLog("calculateDifferentialInsights failed", ev, e);
@@ -1012,7 +1037,8 @@ async function calculateDifferentialInsights(eventId) {
       myTemplates: [],
       uniquePicks: 0,
       differentialCount: 0,
-      templateCount: 0
+      templateCount: 0,
+      myTeam: new Set()
     };
   }
 }
@@ -1932,6 +1958,36 @@ function createInsightsPanel(insights) {
               ${p.ownedByTopRivals ? ' 🔥' : ''}
             </span>
           `).join('')}
+        </div>
+      </div>
+    ` : ''}
+
+    ${insights.myTeam && insights.myTeam.size > 0 ? `
+      <div style="margin-top: 16px;">
+        <h4 style="font-size: 13px; color: #94a3b8; margin: 0 0 8px 0;">
+          🎯 Top Expected Points Next GW
+        </h4>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          ${Array.from(insights.myTeam)
+            .map(pid => ({
+              playerId: pid,
+              name: playerById[pid]?.web_name || `#${pid}`,
+              xPts: Number(playerById[pid]?.ep_next || 0)
+            }))
+            .sort((a, b) => b.xPts - a.xPts)
+            .slice(0, 5)
+            .map(p => `
+              <span style="
+                background: ${colorForXPts(p.xPts)};
+                color: #0b1020;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: 600;
+              ">
+                ${p.name} (${p.xPts > 0 ? p.xPts.toFixed(1) : 'n/a'})
+              </span>
+            `).join('')}
         </div>
       </div>
     ` : ''}

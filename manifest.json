@@ -1,7 +1,7 @@
 {
   "name": "FPL Nicknames",
   "description": "FPL xG overlay",
-  "version": "0.18",
+  "version": "0.23",
   "manifest_version": 3,
 
   "host_permissions": [
